@@ -15,8 +15,7 @@ interface EditorProps {
   jobId: string
   result: JobResult
   onResultChange: (result: JobResult) => void
-  /** Called when user clicks Export; pass current alignment mode so download ZIP uses that variant's TXT */
-  onExport: (alignmentMode?: string) => void
+  onExport: () => void
 }
 
 const DEFAULT_LYRICS_PARAMS: LyricsParams = {
@@ -32,7 +31,6 @@ const DEFAULT_LYRICS_PARAMS: LyricsParams = {
   min_word_confidence: 0.15,
   audio_source: "original",
   normalize: true,
-  alignment_mode: "forcealign",
 }
 
 const PIXELS_PER_BEAT = 8
@@ -65,34 +63,14 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
     width: number
     height: number
   } | null>(null)
-  const [viewAlignmentMode, setViewAlignmentMode] = useState<string>(
-    result.current_alignment_mode ?? "forcealign"
-  )
-
-  const displayResult: JobResult = (() => {
-    const ar = result.alignment_results
-    if (ar && viewAlignmentMode && ar[viewAlignmentMode]) {
-      const v = ar[viewAlignmentMode]
-      return {
-        ...result,
-        words: v.words,
-        phrases: v.phrases,
-        ultrastar_txt: v.ultrastar_txt,
-      }
-    }
-    return result
-  })()
+  const displayResult = result
 
   const lastSavedPhrasesRef = useRef<typeof displayResult.phrases>(displayResult.phrases)
   const isDirty = displayResult.phrases !== lastSavedPhrasesRef.current
 
   useEffect(() => {
-    setViewAlignmentMode(result.current_alignment_mode ?? "forcealign")
-  }, [result.current_alignment_mode])
-
-  useEffect(() => {
     lastSavedPhrasesRef.current = displayResult.phrases
-  }, [viewAlignmentMode, displayResult.phrases])
+  }, [displayResult.phrases])
 
   // Compute pitch bounds for the display
   const allNotes = displayResult.phrases.flatMap((p) => p.notes)
@@ -102,7 +80,7 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
     ? Math.max(...allNotes.map((n) => n.start_beat + n.duration_beats)) + 20
     : 100
 
-  const variant = result.alignment_results?.[viewAlignmentMode]
+  const variant = result.alignment_results?.[result.current_alignment_mode ?? "forcealign"]
   const gap_ms_effective = variant?.gap_ms ?? result.metadata.gap_ms
   const gap_s = gap_ms_effective / 1000
   const ustar_bpm = displayResult.metadata.bpm * 4
@@ -614,29 +592,8 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
         saving={saving}
         isDirty={isDirty}
         onSave={handleSave}
-        onExport={() => onExport(viewAlignmentMode)}
+        onExport={onExport}
       />
-
-      {result.alignment_results && Object.keys(result.alignment_results).length > 1 && (
-        <div className="flex items-center gap-3 flex-wrap">
-          <span className="text-sm text-zinc-400">View alignment:</span>
-          <select
-            value={viewAlignmentMode}
-            onChange={(e) => setViewAlignmentMode(e.target.value)}
-            className="bg-zinc-800 border border-zinc-600 rounded-lg px-3 py-1.5 text-white text-sm
-                       focus:outline-none focus:border-violet-500"
-          >
-            {Object.keys(result.alignment_results).map((mode) => (
-              <option key={mode} value={mode}>
-                {mode}
-              </option>
-            ))}
-          </select>
-          <span className="text-xs text-zinc-500">
-            Switch instantly between alignments generated for this song.
-          </span>
-        </div>
-      )}
 
       {showSettings && (
         <LyricsSettingsPanel

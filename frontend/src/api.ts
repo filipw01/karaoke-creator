@@ -46,11 +46,8 @@ export const updateNotes = async (
 export const getAudioUrl = (jobId: string, track: "original" | "vocals" | "instrumental"): string =>
   `${BASE}/jobs/${jobId}/audio/${track}`
 
-export const getDownloadUrl = (jobId: string, alignmentMode?: string): string => {
-  const base = `${BASE}/jobs/${jobId}/download`
-  if (alignmentMode) return `${base}?alignment_mode=${encodeURIComponent(alignmentMode)}`
-  return base
-}
+export const getDownloadUrl = (jobId: string): string =>
+  `${BASE}/jobs/${jobId}/download`
 
 export const regenerateLyrics = async (jobId: string, params: Partial<LyricsParams>): Promise<JobResult> => {
   const res = await fetch(`${BASE}/jobs/${jobId}/regenerate-lyrics`, {

@@ -41,33 +41,6 @@ export const LyricsSettingsPanel = memo(function LyricsSettingsPanel({
         </p>
       )}
 
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <label className="block text-xs text-zinc-400 mb-1">Alignment Mode</label>
-          <select
-            value={params.alignment_mode}
-            onChange={(e) =>
-              onParamChange("alignment_mode", e.target.value as LyricsParams["alignment_mode"])
-            }
-            className="w-full bg-zinc-900 border border-zinc-600 rounded-lg px-3 py-2 text-white text-sm
-                       focus:outline-none focus:border-violet-500"
-          >
-            <option value="forcealign">ForceAlign (English, pip)</option>
-            <option value="lyrics_aligner">lyrics-aligner (phoneme DNN, English; LYRICS_ALIGNER_ROOT)</option>
-            <option value="nemo">NeMo (ASR timestamps)</option>
-            <option value="whisperx">WhisperX (fixed transcript)</option>
-            <option value="aeneas">aeneas (pip)</option>
-            <option value="mfa">Montreal Forced Aligner (MFA)</option>
-            <option value="gentle">Gentle (Docker localhost:8765)</option>
-            <option value="autolyrixalign">AutoLyrixAlign (AUTOLYRIXALIGN_ROOT)</option>
-            <option value="whisper">Whisper (transcription fallback)</option>
-          </select>
-          <p className="text-[10px] text-zinc-500 mt-1">
-            Choose alignment method then click Regenerate. All aligners run; pick one to compare.
-          </p>
-        </div>
-      </div>
-
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
         <div>
           <label className="block text-xs text-zinc-400 mb-1">Audio Source</label>

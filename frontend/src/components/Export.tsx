@@ -4,14 +4,12 @@ import { getDownloadUrl } from "../api"
 interface ExportProps {
   jobId: string
   result: JobResult
-  /** When set, download ZIP uses this alignment variant's TXT */
-  alignmentMode?: string
   onBack: () => void
   onStartOver: () => void
 }
 
-export const Export = ({ jobId, result, alignmentMode, onBack, onStartOver }: ExportProps) => {
-  const downloadUrl = getDownloadUrl(jobId, alignmentMode)
+export const Export = ({ jobId, result, onBack, onStartOver }: ExportProps) => {
+  const downloadUrl = getDownloadUrl(jobId)
 
   return (
     <div className="max-w-xl mx-auto text-center space-y-8">

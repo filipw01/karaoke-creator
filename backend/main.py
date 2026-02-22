@@ -162,18 +162,7 @@ async def _process_phase2(job: Job, lyrics_text: str) -> None:
         step_msg = "Aligning provided lyrics to audio..." if has_lyrics else "Transcribing lyrics with word timestamps..."
         t = _step(job, JobStatus.EXTRACTING_LYRICS, step_msg)
 
-        from processing.lyrics import (
-            LyricsParams,
-            extract_lyrics,
-            extract_lyrics_aeneas,
-            extract_lyrics_autolyrixalign,
-            extract_lyrics_forcealign,
-            extract_lyrics_gentle,
-            extract_lyrics_mfa,
-            extract_lyrics_nemo,
-            extract_lyrics_whisperx,
-        )
-        from processing.lyrics_aligner import extract_lyrics_lyrics_aligner
+        from processing.lyrics import LyricsParams, extract_lyrics, extract_lyrics_forcealign
         from processing.audio import normalize_audio
 
         params = LyricsParams()
@@ -198,53 +187,29 @@ async def _process_phase2(job: Job, lyrics_text: str) -> None:
         )
         log.info("[%s] Pitch detected in %.1fs -> %d frames", job.id[:8], time.time() - t, len(times))
 
-        # --- Run all aligners (when lyrics provided) and build alignment_results ---
+        # --- Run ForceAlign (when lyrics provided) ---
         alignment_results: dict[str, AlignmentVariant] = {}
-        preferred_order = ("forcealign", "lyrics_aligner", "nemo", "whisperx", "aeneas", "mfa", "gentle", "autolyrixalign")
-        current_mode = preferred_order[0]
+        current_mode = "forcealign"
         words_for_download = None
         line_breaks_for_download: list[int] = []
 
         if has_lyrics:
-            extractors: list[tuple[str, Any]] = [
-                ("lyrics_aligner", extract_lyrics_lyrics_aligner),
-                ("nemo", extract_lyrics_nemo),
-                ("forcealign", extract_lyrics_forcealign),
-                ("aeneas", extract_lyrics_aeneas),
-                ("whisperx", extract_lyrics_whisperx),
-                ("mfa", extract_lyrics_mfa),
-                ("gentle", extract_lyrics_gentle),
-                ("autolyrixalign", extract_lyrics_autolyrixalign),
-            ]
-            for mode, ext in extractors:
-                try:
-                    res = await loop.run_in_executor(None, ext, transcribe_path, lyrics_text.strip(), lang)
-                    if res[0] is None:
-                        log.debug("[%s] %s skipped: %s", job.id[:8], mode, res[1])
-                        continue
-                    w, lb = res[0], res[1]
-                    w = assign_pitch_to_words(w, times, frequencies, confidences)
-                    alignment_results[mode] = (w, lb)
-                    if words_for_download is None:
-                        words_for_download, line_breaks_for_download = w, lb
-                        current_mode = mode
-                except Exception as e:
-                    log.info("[%s] %s failed: %s", job.id[:8], mode, e)
-            if words_for_download is None and alignment_results:
-                for pref in preferred_order:
-                    if pref in alignment_results:
-                        current_mode = pref
-                        break
-                else:
-                    current_mode = next(iter(alignment_results))
-                words_for_download, line_breaks_for_download = alignment_results[current_mode]
-            elif words_for_download is None:
-                # All aligners failed; fall back to Whisper transcription
+            job.progress_message = "Aligning lyrics with ForceAlign..."
+            _notify(job)
+            res = await loop.run_in_executor(
+                None, extract_lyrics_forcealign, transcribe_path, lyrics_text.strip(), lang
+            )
+            if res[0] is not None:
+                w, lb = res[0], res[1]
+                words_for_download = assign_pitch_to_words(w, times, frequencies, confidences)
+                line_breaks_for_download = lb
+                alignment_results["forcealign"] = (words_for_download, line_breaks_for_download)
+            else:
+                log.info("[%s] ForceAlign skipped: %s; falling back to Whisper", job.id[:8], res[1])
                 words_for_download = await loop.run_in_executor(
                     None, extract_lyrics, transcribe_path, lang, params
                 )
                 line_breaks_for_download = []
-                # Map Whisper words to user's lyrics so we preserve case and diacritics (e.g. Polish)
                 lyrics_stripped = lyrics_text.strip()
                 if lyrics_stripped:
                     from processing.lyrics import preprocess_lyrics_for_alignment, _aligner_words_to_lyrics_order
@@ -265,6 +230,7 @@ async def _process_phase2(job: Job, lyrics_text: str) -> None:
             )
             words_for_download = assign_pitch_to_words(words_for_download, times, frequencies, confidences)
             current_mode = "whisper"
+            alignment_results["whisper"] = (words_for_download, [])
 
         # --- Step 7: Generate UltraStar format for each variant ---
         t = _step(job, JobStatus.GENERATING, "Generating UltraStar song file...")
@@ -609,18 +575,7 @@ async def regenerate_lyrics(job_id: str, body: dict[str, Any]) -> dict[str, Any]
     log = logging.getLogger("pipeline")
     loop = asyncio.get_event_loop()
 
-    from processing.lyrics import (
-        LyricsParams,
-        extract_lyrics,
-        extract_lyrics_aeneas,
-        extract_lyrics_autolyrixalign,
-        extract_lyrics_forcealign,
-        extract_lyrics_gentle,
-        extract_lyrics_mfa,
-        extract_lyrics_nemo,
-        extract_lyrics_whisperx,
-    )
-    from processing.lyrics_aligner import extract_lyrics_lyrics_aligner
+    from processing.lyrics import LyricsParams, extract_lyrics, extract_lyrics_forcealign
     from processing.pitch import detect_pitch, assign_pitch_to_words
     from processing.ultrastar import words_to_phrases, generate_ultrastar_txt
 
@@ -644,7 +599,6 @@ async def regenerate_lyrics(job_id: str, body: dict[str, Any]) -> dict[str, Any]
         min_word_confidence=body.get("min_word_confidence", 0.15),
         audio_source=body.get("audio_source", "original"),
         normalize=body.get("normalize", True),
-        alignment_mode=body.get("alignment_mode", "forcealign"),
     )
 
     # Resolve the audio file to feed to Whisper
@@ -660,59 +614,36 @@ async def regenerate_lyrics(job_id: str, body: dict[str, Any]) -> dict[str, Any]
         await loop.run_in_executor(None, normalize_audio, transcribe_path, norm_path)
         transcribe_path = norm_path
 
-    log.info("[%s] Regenerating lyrics (all aligners) (source=%s, normalize=%s)",
+    log.info("[%s] Regenerating lyrics (ForceAlign) (source=%s, normalize=%s)",
              job.id[:8], params.audio_source, params.normalize)
 
     times, frequencies, confidences = await loop.run_in_executor(None, detect_pitch, job.vocals_path)
     alignment_results: dict[str, AlignmentVariant] = {}
-    reg_preferred = ("forcealign", "lyrics_aligner", "nemo", "whisperx", "aeneas", "mfa", "gentle", "autolyrixalign")
-    current_mode = reg_preferred[0]
+    current_mode = "forcealign"
     words_for_download = None
     line_breaks_for_download: list[int] = []
 
     if has_lyrics:
-        reg_extractors: list[tuple[str, Any]] = [
-            ("lyrics_aligner", extract_lyrics_lyrics_aligner),
-            ("nemo", extract_lyrics_nemo),
-            ("forcealign", extract_lyrics_forcealign),
-            ("aeneas", extract_lyrics_aeneas),
-            ("whisperx", extract_lyrics_whisperx),
-            ("mfa", extract_lyrics_mfa),
-            ("gentle", extract_lyrics_gentle),
-            ("autolyrixalign", extract_lyrics_autolyrixalign),
-        ]
-        for mode, ext in reg_extractors:
-            try:
-                res = await loop.run_in_executor(None, ext, transcribe_path, params.initial_prompt, params.language)
-                if res[0] is None:
-                    log.debug("[%s] %s skipped: %s", job.id[:8], mode, res[1])
-                    continue
-                w, lb = res[0], res[1]
-                w = assign_pitch_to_words(w, times, frequencies, confidences)
-                ph, gap_ms_var = words_to_phrases(w, job.real_bpm, line_breaks=lb)
-                txt = generate_ultrastar_txt(
-                    metadata=job.metadata,
-                    phrases=ph,
-                    audio_filename=job.result.audio_file,
-                    vocals_filename=job.result.vocals_file,
-                    instrumental_filename=job.result.instrumental_file,
-                    video_filename=job.result.video_file,
-                )
-                alignment_results[mode] = AlignmentVariant(words=w, phrases=ph, ultrastar_txt=txt, gap_ms=gap_ms_var)
-                if words_for_download is None:
-                    words_for_download, line_breaks_for_download = w, lb
-                    current_mode = mode
-            except Exception as e:
-                log.info("[%s] %s failed: %s", job.id[:8], mode, e)
-        if words_for_download is None and alignment_results:
-            for pref in reg_preferred:
-                if pref in alignment_results:
-                    current_mode = pref
-                    break
-            else:
-                current_mode = next(iter(alignment_results))
-            v = alignment_results[current_mode]
-            words_for_download, line_breaks_for_download = v.words, []
+        res = await loop.run_in_executor(
+            None, extract_lyrics_forcealign, transcribe_path, params.initial_prompt, params.language
+        )
+        if res[0] is not None:
+            w, lb = res[0], res[1]
+            w = assign_pitch_to_words(w, times, frequencies, confidences)
+            ph, gap_ms_var = words_to_phrases(w, job.real_bpm, line_breaks=lb)
+            txt = generate_ultrastar_txt(
+                metadata=job.metadata,
+                phrases=ph,
+                audio_filename=job.result.audio_file,
+                vocals_filename=job.result.vocals_file,
+                instrumental_filename=job.result.instrumental_file,
+                video_filename=job.result.video_file,
+            )
+            alignment_results["forcealign"] = AlignmentVariant(words=w, phrases=ph, ultrastar_txt=txt, gap_ms=gap_ms_var)
+            words_for_download = w
+            line_breaks_for_download = lb
+        else:
+            log.info("[%s] ForceAlign skipped: %s; falling back to Whisper", job.id[:8], res[1])
         if words_for_download is None:
             words_for_download = await loop.run_in_executor(
                 None, extract_lyrics, transcribe_path, params.language, params
@@ -744,8 +675,17 @@ async def regenerate_lyrics(job_id: str, body: dict[str, Any]) -> dict[str, Any]
     else:
         words_for_download = await loop.run_in_executor(None, extract_lyrics, transcribe_path, params.language, params)
         words_for_download = assign_pitch_to_words(words_for_download, times, frequencies, confidences)
-        ph, _ = words_to_phrases(words_for_download, job.real_bpm, line_breaks=[])
+        ph, gap_ms_var = words_to_phrases(words_for_download, job.real_bpm, line_breaks=[])
         current_mode = "whisper"
+        txt = generate_ultrastar_txt(
+            metadata=job.metadata,
+            phrases=ph,
+            audio_filename=job.result.audio_file,
+            vocals_filename=job.result.vocals_file,
+            instrumental_filename=job.result.instrumental_file,
+            video_filename=job.result.video_file,
+        )
+        alignment_results["whisper"] = AlignmentVariant(words=words_for_download, phrases=ph, ultrastar_txt=txt, gap_ms=gap_ms_var)
 
     real_bpm = job.real_bpm
     job.metadata.bpm = real_bpm

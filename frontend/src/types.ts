@@ -65,16 +65,6 @@ export interface LyricsParams {
   min_word_confidence: number
   audio_source: string
   normalize: boolean
-  alignment_mode:
-    | "lyrics_aligner"
-    | "nemo"
-    | "forcealign"
-    | "aeneas"
-    | "whisperx"
-    | "mfa"
-    | "gentle"
-    | "autolyrixalign"
-    | "whisper"
 }
 
 export interface ProgressEvent {
