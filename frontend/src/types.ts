@@ -30,6 +30,14 @@ export interface Phrase {
   end_beat: number
 }
 
+export interface AlignmentVariant {
+  words: Array<Word>
+  phrases: Array<Phrase>
+  ultrastar_txt: string
+  /** Gap in ms used to build this variant's phrases; use for playback when this variant is selected */
+  gap_ms?: number
+}
+
 export interface JobResult {
   metadata: SongMetadata
   words: Array<Word>
@@ -39,6 +47,9 @@ export interface JobResult {
   vocals_file: string
   instrumental_file: string
   video_file: string
+  /** Precomputed alignments for instant switch; key = alignment mode */
+  alignment_results?: Record<string, AlignmentVariant>
+  current_alignment_mode?: string
 }
 
 export interface LyricsParams {
@@ -54,8 +65,16 @@ export interface LyricsParams {
   min_word_confidence: number
   audio_source: string
   normalize: boolean
-  alignment_mode: "qwen3" | "proportional"
-  lyrics_start_offset: number
+  alignment_mode:
+    | "lyrics_aligner"
+    | "nemo"
+    | "forcealign"
+    | "aeneas"
+    | "whisperx"
+    | "mfa"
+    | "gentle"
+    | "autolyrixalign"
+    | "whisper"
 }
 
 export interface ProgressEvent {

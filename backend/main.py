@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from models import Job, JobResult, JobStatus, SongMetadata
+from models import AlignmentVariant, Job, JobResult, JobStatus, SongMetadata
 
 logging.basicConfig(
     level=logging.INFO,
@@ -165,10 +165,15 @@ async def _process_phase2(job: Job, lyrics_text: str) -> None:
         from processing.lyrics import (
             LyricsParams,
             extract_lyrics,
+            extract_lyrics_aeneas,
+            extract_lyrics_autolyrixalign,
+            extract_lyrics_forcealign,
+            extract_lyrics_gentle,
+            extract_lyrics_mfa,
             extract_lyrics_nemo,
-            extract_lyrics_proportional,
-            extract_lyrics_qwen3,
+            extract_lyrics_whisperx,
         )
+        from processing.lyrics_aligner import extract_lyrics_lyrics_aligner
         from processing.audio import normalize_audio
 
         params = LyricsParams()
@@ -184,49 +189,7 @@ async def _process_phase2(job: Job, lyrics_text: str) -> None:
             await loop.run_in_executor(None, normalize_audio, vocals_path, norm_path)
             transcribe_path = norm_path
 
-        line_breaks: list[int] = []
-        if has_lyrics:
-            if params.alignment_mode == "proportional":
-                words, line_breaks = await loop.run_in_executor(
-                    None,
-                    extract_lyrics_proportional,
-                    transcribe_path,
-                    lyrics_text.strip(),
-                    params.lyrics_start_offset,
-                )
-                log.info("[%s] Proportional alignment: %d words, %d line breaks",
-                         job.id[:8], len(words), len(line_breaks))
-            else:
-                # Qwen3 -> NeMo -> proportional fallback
-                result = await loop.run_in_executor(
-                    None, extract_lyrics_qwen3, transcribe_path, lyrics_text.strip(), lang
-                )
-                if result[0] is not None:
-                    words, line_breaks = result[0], result[1]
-                    log.info("[%s] Qwen3: %d words, %d line breaks", job.id[:8], len(words), len(line_breaks))
-                else:
-                    log.info("[%s] Qwen3 unavailable (%s), trying NeMo", job.id[:8], result[1])
-                    result = await loop.run_in_executor(
-                        None, extract_lyrics_nemo, transcribe_path, lyrics_text.strip(), lang
-                    )
-                    if result[0] is not None:
-                        words, line_breaks = result[0], result[1]
-                        log.info("[%s] NeMo: %d words, %d line breaks", job.id[:8], len(words), len(line_breaks))
-                    else:
-                        log.info("[%s] NeMo unavailable (%s), proportional fallback", job.id[:8], result[1])
-                        words, line_breaks = await loop.run_in_executor(
-                            None,
-                            extract_lyrics_proportional,
-                            transcribe_path,
-                            lyrics_text.strip(),
-                            params.lyrics_start_offset,
-                        )
-        else:
-            words = await loop.run_in_executor(
-                None, extract_lyrics, transcribe_path, lang, params
-            )
-
-        # --- Step 6: Detect pitch ---
+        # --- Step 6: Detect pitch (once) ---
         t = _step(job, JobStatus.DETECTING_PITCH, "Analyzing vocal pitch...")
 
         from processing.pitch import detect_pitch, assign_pitch_to_words
@@ -234,20 +197,80 @@ async def _process_phase2(job: Job, lyrics_text: str) -> None:
             None, detect_pitch, vocals_path
         )
         log.info("[%s] Pitch detected in %.1fs -> %d frames", job.id[:8], time.time() - t, len(times))
-        words = assign_pitch_to_words(words, times, frequencies, confidences)
-        log.info("[%s] Pitch assigned to %d words", job.id[:8], len(words))
 
-        # --- Step 7: Generate UltraStar format ---
+        # --- Run all aligners (when lyrics provided) and build alignment_results ---
+        alignment_results: dict[str, AlignmentVariant] = {}
+        preferred_order = ("forcealign", "lyrics_aligner", "nemo", "whisperx", "aeneas", "mfa", "gentle", "autolyrixalign")
+        current_mode = preferred_order[0]
+        words_for_download = None
+        line_breaks_for_download: list[int] = []
+
+        if has_lyrics:
+            extractors: list[tuple[str, Any]] = [
+                ("lyrics_aligner", extract_lyrics_lyrics_aligner),
+                ("nemo", extract_lyrics_nemo),
+                ("forcealign", extract_lyrics_forcealign),
+                ("aeneas", extract_lyrics_aeneas),
+                ("whisperx", extract_lyrics_whisperx),
+                ("mfa", extract_lyrics_mfa),
+                ("gentle", extract_lyrics_gentle),
+                ("autolyrixalign", extract_lyrics_autolyrixalign),
+            ]
+            for mode, ext in extractors:
+                try:
+                    res = await loop.run_in_executor(None, ext, transcribe_path, lyrics_text.strip(), lang)
+                    if res[0] is None:
+                        log.debug("[%s] %s skipped: %s", job.id[:8], mode, res[1])
+                        continue
+                    w, lb = res[0], res[1]
+                    w = assign_pitch_to_words(w, times, frequencies, confidences)
+                    alignment_results[mode] = (w, lb)
+                    if words_for_download is None:
+                        words_for_download, line_breaks_for_download = w, lb
+                        current_mode = mode
+                except Exception as e:
+                    log.info("[%s] %s failed: %s", job.id[:8], mode, e)
+            if words_for_download is None and alignment_results:
+                for pref in preferred_order:
+                    if pref in alignment_results:
+                        current_mode = pref
+                        break
+                else:
+                    current_mode = next(iter(alignment_results))
+                words_for_download, line_breaks_for_download = alignment_results[current_mode]
+            elif words_for_download is None:
+                # All aligners failed; fall back to Whisper transcription
+                words_for_download = await loop.run_in_executor(
+                    None, extract_lyrics, transcribe_path, lang, params
+                )
+                line_breaks_for_download = []
+                # Map Whisper words to user's lyrics so we preserve case and diacritics (e.g. Polish)
+                lyrics_stripped = lyrics_text.strip()
+                if lyrics_stripped:
+                    from processing.lyrics import preprocess_lyrics_for_alignment, _aligner_words_to_lyrics_order
+                    _, all_words, line_breaks_pre = preprocess_lyrics_for_alignment(lyrics_stripped)
+                    if all_words:
+                        aligned = [
+                            type("W", (), {"text": w.text, "start_time": w.start, "end_time": w.end})()
+                            for w in words_for_download
+                        ]
+                        words_for_download = _aligner_words_to_lyrics_order(aligned, all_words)
+                        line_breaks_for_download = line_breaks_pre
+                words_for_download = assign_pitch_to_words(words_for_download, times, frequencies, confidences)
+                alignment_results["whisper"] = (words_for_download, line_breaks_for_download)
+                current_mode = "whisper"
+        else:
+            words_for_download = await loop.run_in_executor(
+                None, extract_lyrics, transcribe_path, lang, params
+            )
+            words_for_download = assign_pitch_to_words(words_for_download, times, frequencies, confidences)
+            current_mode = "whisper"
+
+        # --- Step 7: Generate UltraStar format for each variant ---
         t = _step(job, JobStatus.GENERATING, "Generating UltraStar song file...")
 
         from processing.ultrastar import words_to_phrases, generate_ultrastar_txt
         from processing.audio import convert_to_mp3, copy_video
-
-        phrases, gap_ms = words_to_phrases(words, job.real_bpm, line_breaks=line_breaks)
-        log.info("[%s] Generated %d phrases from %d words (GAP=%.0fms)", job.id[:8], len(phrases), len(words), gap_ms)
-
-        job.metadata.bpm = job.real_bpm
-        job.metadata.gap_ms = gap_ms
 
         safe_name = _sanitize_filename(
             f"{job.metadata.artist} - {job.metadata.title}"
@@ -256,6 +279,37 @@ async def _process_phase2(job: Job, lyrics_text: str) -> None:
         vocals_mp3 = f"{safe_name} [VOC].mp3"
         instrumental_mp3 = f"{safe_name} [INSTR].mp3"
         video_mp4 = f"{safe_name}.mp4" if has_video else ""
+
+        def build_variant(w: Any, lb: list[int]) -> AlignmentVariant:
+            ph, gap_ms = words_to_phrases(w, job.real_bpm, line_breaks=lb)
+            job.metadata.bpm = job.real_bpm
+            job.metadata.gap_ms = gap_ms
+            txt = generate_ultrastar_txt(
+                metadata=job.metadata,
+                phrases=ph,
+                audio_filename=audio_mp3,
+                vocals_filename=vocals_mp3,
+                instrumental_filename=instrumental_mp3,
+                video_filename=video_mp4,
+            )
+            return AlignmentVariant(words=w, phrases=ph, ultrastar_txt=txt, gap_ms=gap_ms)
+
+        variants_for_result: dict[str, AlignmentVariant] = {}
+        for mode, (w, lb) in alignment_results.items():
+            variants_for_result[mode] = build_variant(w, lb)
+        phrases, gap_ms = words_to_phrases(words_for_download, job.real_bpm, line_breaks=line_breaks_for_download)
+        job.metadata.bpm = job.real_bpm
+        job.metadata.gap_ms = gap_ms
+        log.info("[%s] Generated %d phrases from %d words (GAP=%.0fms)", job.id[:8], len(phrases), len(words_for_download), gap_ms)
+
+        ultrastar_txt = generate_ultrastar_txt(
+            metadata=job.metadata,
+            phrases=phrases,
+            audio_filename=audio_mp3,
+            vocals_filename=vocals_mp3,
+            instrumental_filename=instrumental_mp3,
+            video_filename=video_mp4,
+        )
 
         log.info("[%s] Converting to MP3...", job.id[:8])
         await loop.run_in_executor(
@@ -280,35 +334,29 @@ async def _process_phase2(job: Job, lyrics_text: str) -> None:
 
         log.info("[%s] File conversion done in %.1fs", job.id[:8], time.time() - t)
 
-        ultrastar_txt = generate_ultrastar_txt(
-            metadata=job.metadata,
-            phrases=phrases,
-            audio_filename=audio_mp3,
-            vocals_filename=vocals_mp3,
-            instrumental_filename=instrumental_mp3,
-            video_filename=video_mp4,
-        )
-
         txt_path = os.path.join(work_dir, f"{safe_name}.txt")
         with open(txt_path, "w", encoding="utf-8") as f:
             f.write(ultrastar_txt)
 
         job.result = JobResult(
             metadata=job.metadata,
-            words=words,
+            words=words_for_download,
             phrases=phrases,
             ultrastar_txt=ultrastar_txt,
             audio_file=audio_mp3,
             vocals_file=vocals_mp3,
             instrumental_file=instrumental_mp3,
             video_file=video_mp4,
+            alignment_results=variants_for_result,
+            current_alignment_mode=current_mode,
         )
 
         total = time.time() - phase_start
         job.status = JobStatus.DONE
         job.progress_message = "Done! Your karaoke song is ready."
         _notify(job)
-        log.info("[%s] Phase 2 complete in %.1fs", job.id[:8], total)
+        modes_str = ", ".join(sorted(variants_for_result.keys()))
+        log.info("[%s] Phase 2 complete in %.1fs. Alignment modes: %s", job.id[:8], total, modes_str)
 
     except Exception as e:
         log.exception("[%s] Phase 2 failed after %.1fs", job.id[:8], time.time() - phase_start)
@@ -396,6 +444,7 @@ async def confirm_lyrics(job_id: str, body: dict[str, Any]) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="Job is not awaiting lyrics confirmation")
 
     lyrics_text = body.get("lyrics", "")
+    job.confirmed_lyrics = lyrics_text
     asyncio.create_task(_process_phase2(job, lyrics_text))
     return {"status": "started"}
 
@@ -478,14 +527,22 @@ async def get_result(job_id: str) -> dict[str, Any]:
     if job.status != JobStatus.DONE or not job.result:
         raise HTTPException(status_code=400, detail="Job not done yet")
 
+    alignment_results = getattr(job.result, "alignment_results", {}) or {}
+    current_mode = getattr(job.result, "current_alignment_mode", "forcealign")
+    serialized_alignments: dict[str, dict[str, Any]] = {}
+    for k, v in alignment_results.items():
+        serialized_alignments[k] = {
+            "words": [asdict(w) for w in v.words],
+            "phrases": [{"notes": [asdict(n) for n in p.notes], "end_beat": p.end_beat} for p in v.phrases],
+            "ultrastar_txt": v.ultrastar_txt,
+            "gap_ms": getattr(v, "gap_ms", 0.0),
+        }
+
     return {
         "metadata": asdict(job.result.metadata),
         "words": [asdict(w) for w in job.result.words],
         "phrases": [
-            {
-                "notes": [asdict(n) for n in p.notes],
-                "end_beat": p.end_beat,
-            }
+            {"notes": [asdict(n) for n in p.notes], "end_beat": p.end_beat}
             for p in job.result.phrases
         ],
         "ultrastar_txt": job.result.ultrastar_txt,
@@ -493,6 +550,8 @@ async def get_result(job_id: str) -> dict[str, Any]:
         "vocals_file": job.result.vocals_file,
         "instrumental_file": job.result.instrumental_file,
         "video_file": job.result.video_file,
+        "alignment_results": serialized_alignments,
+        "current_alignment_mode": current_mode,
     }
 
 
@@ -553,10 +612,15 @@ async def regenerate_lyrics(job_id: str, body: dict[str, Any]) -> dict[str, Any]
     from processing.lyrics import (
         LyricsParams,
         extract_lyrics,
+        extract_lyrics_aeneas,
+        extract_lyrics_autolyrixalign,
+        extract_lyrics_forcealign,
+        extract_lyrics_gentle,
+        extract_lyrics_mfa,
         extract_lyrics_nemo,
-        extract_lyrics_proportional,
-        extract_lyrics_qwen3,
+        extract_lyrics_whisperx,
     )
+    from processing.lyrics_aligner import extract_lyrics_lyrics_aligner
     from processing.pitch import detect_pitch, assign_pitch_to_words
     from processing.ultrastar import words_to_phrases, generate_ultrastar_txt
 
@@ -564,6 +628,8 @@ async def regenerate_lyrics(job_id: str, body: dict[str, Any]) -> dict[str, Any]
 
     # Build params from request body (defaults mirror LyricsParams dataclass)
     initial_prompt = body.get("initial_prompt", "These are song lyrics with singing.")
+    if (not initial_prompt or initial_prompt == "These are song lyrics with singing." or len(initial_prompt) < 100) and getattr(job, "confirmed_lyrics", ""):
+        initial_prompt = job.confirmed_lyrics
     has_lyrics = bool(initial_prompt) and "\n" in initial_prompt and len(initial_prompt) > 100
     params = LyricsParams(
         model_size=body.get("model_size", "large-v3"),
@@ -578,8 +644,7 @@ async def regenerate_lyrics(job_id: str, body: dict[str, Any]) -> dict[str, Any]
         min_word_confidence=body.get("min_word_confidence", 0.15),
         audio_source=body.get("audio_source", "original"),
         normalize=body.get("normalize", True),
-        alignment_mode=body.get("alignment_mode", "qwen3"),
-        lyrics_start_offset=body.get("lyrics_start_offset", 2.0),
+        alignment_mode=body.get("alignment_mode", "forcealign"),
     )
 
     # Resolve the audio file to feed to Whisper
@@ -595,71 +660,123 @@ async def regenerate_lyrics(job_id: str, body: dict[str, Any]) -> dict[str, Any]
         await loop.run_in_executor(None, normalize_audio, transcribe_path, norm_path)
         transcribe_path = norm_path
 
-    log.info("[%s] Regenerating lyrics (source=%s, normalize=%s): %s",
-             job.id[:8], params.audio_source, params.normalize, params)
+    log.info("[%s] Regenerating lyrics (all aligners) (source=%s, normalize=%s)",
+             job.id[:8], params.audio_source, params.normalize)
 
-    line_breaks: list[int] = []
-    if has_lyrics:
-        if params.alignment_mode == "proportional":
-            words, line_breaks = await loop.run_in_executor(
-                None,
-                extract_lyrics_proportional,
-                transcribe_path,
-                params.initial_prompt,
-                params.lyrics_start_offset,
-            )
-        else:
-            result = await loop.run_in_executor(
-                None, extract_lyrics_qwen3, transcribe_path, params.initial_prompt, params.language
-            )
-            if result[0] is not None:
-                words, line_breaks = result[0], result[1]
-            else:
-                result = await loop.run_in_executor(
-                    None, extract_lyrics_nemo, transcribe_path, params.initial_prompt, params.language
-                )
-                if result[0] is not None:
-                    words, line_breaks = result[0], result[1]
-                else:
-                    words, line_breaks = await loop.run_in_executor(
-                        None,
-                        extract_lyrics_proportional,
-                        transcribe_path,
-                        params.initial_prompt,
-                        params.lyrics_start_offset,
-                    )
-    else:
-        words = await loop.run_in_executor(None, extract_lyrics, transcribe_path, params.language, params)
-
-    # Pitch always comes from vocals (not original mix)
     times, frequencies, confidences = await loop.run_in_executor(None, detect_pitch, job.vocals_path)
-    words = assign_pitch_to_words(words, times, frequencies, confidences)
+    alignment_results: dict[str, AlignmentVariant] = {}
+    reg_preferred = ("forcealign", "lyrics_aligner", "nemo", "whisperx", "aeneas", "mfa", "gentle", "autolyrixalign")
+    current_mode = reg_preferred[0]
+    words_for_download = None
+    line_breaks_for_download: list[int] = []
 
-    # Re-generate phrases
+    if has_lyrics:
+        reg_extractors: list[tuple[str, Any]] = [
+            ("lyrics_aligner", extract_lyrics_lyrics_aligner),
+            ("nemo", extract_lyrics_nemo),
+            ("forcealign", extract_lyrics_forcealign),
+            ("aeneas", extract_lyrics_aeneas),
+            ("whisperx", extract_lyrics_whisperx),
+            ("mfa", extract_lyrics_mfa),
+            ("gentle", extract_lyrics_gentle),
+            ("autolyrixalign", extract_lyrics_autolyrixalign),
+        ]
+        for mode, ext in reg_extractors:
+            try:
+                res = await loop.run_in_executor(None, ext, transcribe_path, params.initial_prompt, params.language)
+                if res[0] is None:
+                    log.debug("[%s] %s skipped: %s", job.id[:8], mode, res[1])
+                    continue
+                w, lb = res[0], res[1]
+                w = assign_pitch_to_words(w, times, frequencies, confidences)
+                ph, gap_ms_var = words_to_phrases(w, job.real_bpm, line_breaks=lb)
+                txt = generate_ultrastar_txt(
+                    metadata=job.metadata,
+                    phrases=ph,
+                    audio_filename=job.result.audio_file,
+                    vocals_filename=job.result.vocals_file,
+                    instrumental_filename=job.result.instrumental_file,
+                    video_filename=job.result.video_file,
+                )
+                alignment_results[mode] = AlignmentVariant(words=w, phrases=ph, ultrastar_txt=txt, gap_ms=gap_ms_var)
+                if words_for_download is None:
+                    words_for_download, line_breaks_for_download = w, lb
+                    current_mode = mode
+            except Exception as e:
+                log.info("[%s] %s failed: %s", job.id[:8], mode, e)
+        if words_for_download is None and alignment_results:
+            for pref in reg_preferred:
+                if pref in alignment_results:
+                    current_mode = pref
+                    break
+            else:
+                current_mode = next(iter(alignment_results))
+            v = alignment_results[current_mode]
+            words_for_download, line_breaks_for_download = v.words, []
+        if words_for_download is None:
+            words_for_download = await loop.run_in_executor(
+                None, extract_lyrics, transcribe_path, params.language, params
+            )
+            line_breaks_for_download = []
+            lyrics_stripped = (params.initial_prompt or "").strip()
+            if lyrics_stripped and len(lyrics_stripped) > 100:
+                from processing.lyrics import preprocess_lyrics_for_alignment, _aligner_words_to_lyrics_order
+                _, all_words, line_breaks_pre = preprocess_lyrics_for_alignment(lyrics_stripped)
+                if all_words:
+                    aligned = [
+                        type("W", (), {"text": w.text, "start_time": w.start, "end_time": w.end})()
+                        for w in words_for_download
+                    ]
+                    words_for_download = _aligner_words_to_lyrics_order(aligned, all_words)
+                    line_breaks_for_download = line_breaks_pre
+            words_for_download = assign_pitch_to_words(words_for_download, times, frequencies, confidences)
+            ph, gap_ms_var = words_to_phrases(words_for_download, job.real_bpm, line_breaks=line_breaks_for_download)
+            txt = generate_ultrastar_txt(
+                metadata=job.metadata,
+                phrases=ph,
+                audio_filename=job.result.audio_file,
+                vocals_filename=job.result.vocals_file,
+                instrumental_filename=job.result.instrumental_file,
+                video_filename=job.result.video_file,
+            )
+            alignment_results["whisper"] = AlignmentVariant(words=words_for_download, phrases=ph, ultrastar_txt=txt, gap_ms=gap_ms_var)
+            current_mode = "whisper"
+    else:
+        words_for_download = await loop.run_in_executor(None, extract_lyrics, transcribe_path, params.language, params)
+        words_for_download = assign_pitch_to_words(words_for_download, times, frequencies, confidences)
+        ph, _ = words_to_phrases(words_for_download, job.real_bpm, line_breaks=[])
+        current_mode = "whisper"
+
     real_bpm = job.real_bpm
-    phrases, gap_ms = words_to_phrases(words, real_bpm, line_breaks=line_breaks)
-
-    # Update metadata
     job.metadata.bpm = real_bpm
-    job.metadata.gap_ms = gap_ms
+    if alignment_results and current_mode in alignment_results:
+        v = alignment_results[current_mode]
+        words_for_download = v.words
+        phrases = v.phrases
+        ultrastar_txt = v.ultrastar_txt
+        job.metadata.gap_ms = job.metadata.gap_ms or (v.words[0].start * 1000.0 if v.words else 0.0)
+    elif words_for_download is not None:
+        phrases, gap_ms = words_to_phrases(words_for_download, real_bpm, line_breaks=line_breaks_for_download)
+        job.metadata.gap_ms = gap_ms
+        ultrastar_txt = generate_ultrastar_txt(
+            metadata=job.metadata,
+            phrases=phrases,
+            audio_filename=job.result.audio_file,
+            vocals_filename=job.result.vocals_file,
+            instrumental_filename=job.result.instrumental_file,
+            video_filename=job.result.video_file,
+        )
+    else:
+        phrases, job.metadata.gap_ms = [], 0.0
+        ultrastar_txt = ""
 
-    # Regenerate TXT
-    ultrastar_txt = generate_ultrastar_txt(
-        metadata=job.metadata,
-        phrases=phrases,
-        audio_filename=job.result.audio_file,
-        vocals_filename=job.result.vocals_file,
-        instrumental_filename=job.result.instrumental_file,
-        video_filename=job.result.video_file,
-    )
-
-    # Update result
-    job.result.words = words
+    job.result.words = words_for_download or []
     job.result.phrases = phrases
     job.result.ultrastar_txt = ultrastar_txt
     job.result.metadata = job.metadata
+    job.result.alignment_results = alignment_results
+    job.result.current_alignment_mode = current_mode
 
-    # Rewrite TXT file
     safe_name = _sanitize_filename(
         f"{job.metadata.artist} - {job.metadata.title}"
     ) or "song"
@@ -667,20 +784,34 @@ async def regenerate_lyrics(job_id: str, body: dict[str, Any]) -> dict[str, Any]
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(ultrastar_txt)
 
-    log.info("[%s] Lyrics regenerated: %d words, %d phrases", job.id[:8], len(words), len(phrases))
+    modes_str = ", ".join(sorted(alignment_results.keys()))
+    log.info("[%s] Lyrics regenerated: %d alignments, current=%s. Modes: %s", job.id[:8], len(alignment_results), current_mode, modes_str)
+
+    def _serialize_alignment_results(d: dict[str, AlignmentVariant]) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for k, v in d.items():
+            out[k] = {
+                "words": [asdict(w) for w in v.words],
+                "phrases": [{"notes": [asdict(n) for n in p.notes], "end_beat": p.end_beat} for p in v.phrases],
+                "ultrastar_txt": v.ultrastar_txt,
+                "gap_ms": v.gap_ms,
+            }
+        return out
 
     return {
         "metadata": asdict(job.result.metadata),
-        "words": [asdict(w) for w in words],
+        "words": [asdict(w) for w in job.result.words],
         "phrases": [
             {"notes": [asdict(n) for n in p.notes], "end_beat": p.end_beat}
-            for p in phrases
+            for p in job.result.phrases
         ],
         "ultrastar_txt": ultrastar_txt,
         "audio_file": job.result.audio_file,
         "vocals_file": job.result.vocals_file,
         "instrumental_file": job.result.instrumental_file,
         "video_file": job.result.video_file,
+        "alignment_results": _serialize_alignment_results(alignment_results),
+        "current_alignment_mode": current_mode,
     }
 
 
@@ -710,13 +841,19 @@ async def get_audio(job_id: str, track: str) -> FileResponse:
 
 
 @app.get("/api/jobs/{job_id}/download")
-async def download_zip(job_id: str) -> StreamingResponse:
-    """Download a ZIP containing TXT + all audio files."""
+async def download_zip(job_id: str, alignment_mode: str | None = None) -> StreamingResponse:
+    """Download a ZIP containing TXT + all audio files. Optional alignment_mode uses that variant's TXT."""
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if not job.result:
         raise HTTPException(status_code=400, detail="No result yet")
+
+    txt_content = job.result.ultrastar_txt
+    if alignment_mode:
+        ar = getattr(job.result, "alignment_results", {}) or {}
+        if alignment_mode in ar:
+            txt_content = ar[alignment_mode].ultrastar_txt
 
     safe_name = _sanitize_filename(
         f"{job.result.metadata.artist} - {job.result.metadata.title}"
@@ -727,7 +864,7 @@ async def download_zip(job_id: str) -> StreamingResponse:
         folder = safe_name
 
         # TXT file
-        zf.writestr(f"{folder}/{safe_name}.txt", job.result.ultrastar_txt)
+        zf.writestr(f"{folder}/{safe_name}.txt", txt_content)
 
         # Audio + video files
         for filename in [

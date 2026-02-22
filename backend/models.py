@@ -56,6 +56,15 @@ class SongMetadata:
 
 
 @dataclass
+class AlignmentVariant:
+    """Precomputed result for one alignment mode."""
+    words: list[Word] = field(default_factory=list)
+    phrases: list[Phrase] = field(default_factory=list)
+    ultrastar_txt: str = ""
+    gap_ms: float = 0.0
+
+
+@dataclass
 class JobResult:
     metadata: SongMetadata = field(default_factory=SongMetadata)
     words: list[Word] = field(default_factory=list)
@@ -65,6 +74,9 @@ class JobResult:
     vocals_file: str = ""
     instrumental_file: str = ""
     video_file: str = ""
+    # All alignment variants for instant switch; key = alignment_mode
+    alignment_results: dict[str, AlignmentVariant] = field(default_factory=dict)
+    current_alignment_mode: str = "forcealign"
 
 
 @dataclass
@@ -86,3 +98,4 @@ class Job:
     has_video: bool = False
     real_bpm: float = 0.0
     found_lyrics: str = ""
+    confirmed_lyrics: str = ""

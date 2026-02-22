@@ -62,7 +62,9 @@ export const EditorPage = () => {
       jobId={jobId!}
       result={result}
       onResultChange={setResult}
-      onExport={() => navigate(`/export/${jobId}`)}
+      onExport={(alignmentMode) =>
+        navigate(`/export/${jobId}`, { state: alignmentMode != null ? { alignmentMode } : undefined })
+      }
     />
   )
 }

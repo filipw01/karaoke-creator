@@ -11,6 +11,16 @@ numpy>=1.26.0
 ffmpeg-python>=0.2.0
 torchcodec>=0.10.0
 llama-cpp-python>=0.3.0
-qwen-asr>=0.0.6
 nemo-toolkit-asr>=2.8.0rc2
+hydra-core>=1.3.0
+lightning>=2.0.0
 yt-dlp>=2024.0.0
+g2p_en>=2.1.0
+# Optional aligners (install for all alignment modes; skip any that fail)
+forcealign>=1.1.0
+nltk>=3.8.0
+# Optional: for scripts/setup_optional_aligners.py to download AutoLyrixAlign from Google Drive
+# gdown>=4.7.0
+# aeneas: pip install numpy && pip install aeneas (if needed)
+# whisperx>=3.0.0
+# Montreal-Forced-Aligner>=3.0.0

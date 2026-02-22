@@ -52,29 +52,20 @@ export const LyricsSettingsPanel = memo(function LyricsSettingsPanel({
             className="w-full bg-zinc-900 border border-zinc-600 rounded-lg px-3 py-2 text-white text-sm
                        focus:outline-none focus:border-violet-500"
           >
-            <option value="qwen3">Qwen3 + NeMo (precise forced alignment, multilingual)</option>
-            <option value="proportional">Proportional (spread lyrics across song)</option>
+            <option value="forcealign">ForceAlign (English, pip)</option>
+            <option value="lyrics_aligner">lyrics-aligner (phoneme DNN, English; LYRICS_ALIGNER_ROOT)</option>
+            <option value="nemo">NeMo (ASR timestamps)</option>
+            <option value="whisperx">WhisperX (fixed transcript)</option>
+            <option value="aeneas">aeneas (pip)</option>
+            <option value="mfa">Montreal Forced Aligner (MFA)</option>
+            <option value="gentle">Gentle (Docker localhost:8765)</option>
+            <option value="autolyrixalign">AutoLyrixAlign (AUTOLYRIXALIGN_ROOT)</option>
+            <option value="whisper">Whisper (transcription fallback)</option>
           </select>
           <p className="text-[10px] text-zinc-500 mt-1">
-            Qwen3 for 11 languages; NeMo fallback for e.g. Polish. Proportional as last resort.
+            Choose alignment method then click Regenerate. All aligners run; pick one to compare.
           </p>
         </div>
-        {params.alignment_mode === "proportional" && (
-          <div>
-            <label className="block text-xs text-zinc-400 mb-1">Intro Skip (seconds)</label>
-            <input
-              type="number"
-              min={0}
-              max={30}
-              step={0.5}
-              value={params.lyrics_start_offset}
-              onChange={(e) => onParamChange("lyrics_start_offset", Number.parseFloat(e.target.value) ?? 0)}
-              className="w-full bg-zinc-900 border border-zinc-600 rounded-lg px-3 py-2 text-white text-sm
-                         focus:outline-none focus:border-violet-500"
-            />
-            <p className="text-[10px] text-zinc-500 mt-1">Skip this many seconds at start (instrumental intro)</p>
-          </div>
-        )}
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">

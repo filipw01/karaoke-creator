@@ -34,6 +34,18 @@ pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org forcea
 # or: pip install git+https://github.com/lukerbs/forcealign.git
 ```
 
+### Optional aligners
+
+The app runs several aligners when lyrics are provided; only those that are installed and configured are used. Unavailable aligners are skipped (no error).
+
+- **lyrics_aligner** and **AutoLyrixAlign**: run the setup script once to clone/download them and create `backend/.env.optional` with the correct paths:
+  ```bash
+  cd backend && ./venv/bin/python scripts/setup_optional_aligners.py
+  ```
+  This clones [schufo/lyrics-aligner](https://github.com/schufo/lyrics-aligner), creates the required `karaoke_word2phonemes.pickle`, and downloads AutoLyrixAlign from Google Drive (requires `pip install gdown`). If gdown is not installed, only lyrics-aligner is set up; re-run after installing gdown to fetch AutoLyrixAlign. The script writes `LYRICS_ALIGNER_ROOT`, `LYRICS_ALIGNER_PYTHON`, and (if present) `AUTOLYRIXALIGN_ROOT` into `backend/.env.optional`.
+
+- **aeneas / whisperx / MFA / gentle**: see comments in `backend/requirements.txt` and the code for install. They are optional.
+
 ### Frontend
 
 ```bash
@@ -48,8 +60,21 @@ npm install
 ```bash
 cd backend
 source venv/bin/activate
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+uvicorn main:app --reload --host 0.0.0.0 --port 8000 --reload-exclude venv
 ```
+
+To enable optional aligners, set their env vars before starting the server (use your actual paths):
+
+```bash
+cd backend
+source venv/bin/activate
+export LYRICS_ALIGNER_ROOT=/path/to/lyrics-aligner    # clone schufo/lyrics-aligner, add model files
+export LYRICS_ALIGNER_PYTHON=python                   # optional: path to that repo’s Python
+export AUTOLYRIXALIGN_ROOT=/path/to/autolyrixalign    # NUS AutoLyrixAlign dir with align.py
+uvicorn main:app --reload --host 0.0.0.0 --port 8000 --reload-exclude venv
+```
+
+Or run `python scripts/setup_optional_aligners.py` from the backend to download the optional aligners and generate `backend/.env.optional`, then start the server with `./run.sh`.
 
 ### Frontend (port 5173)
 

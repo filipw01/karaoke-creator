@@ -15,7 +15,8 @@ interface EditorProps {
   jobId: string
   result: JobResult
   onResultChange: (result: JobResult) => void
-  onExport: () => void
+  /** Called when user clicks Export; pass current alignment mode so download ZIP uses that variant's TXT */
+  onExport: (alignmentMode?: string) => void
 }
 
 const DEFAULT_LYRICS_PARAMS: LyricsParams = {
@@ -31,8 +32,7 @@ const DEFAULT_LYRICS_PARAMS: LyricsParams = {
   min_word_confidence: 0.15,
   audio_source: "original",
   normalize: true,
-  alignment_mode: "qwen3",
-  lyrics_start_offset: 2,
+  alignment_mode: "forcealign",
 }
 
 const PIXELS_PER_BEAT = 8
@@ -59,25 +59,53 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
   const audioRef = useRef<HTMLAudioElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
-  const lastSavedPhrasesRef = useRef<typeof result.phrases>(result.phrases)
-  const isDirty = result.phrases !== lastSavedPhrasesRef.current
   const [editorAnchor, setEditorAnchor] = useState<{
     left: number
     top: number
     width: number
     height: number
   } | null>(null)
+  const [viewAlignmentMode, setViewAlignmentMode] = useState<string>(
+    result.current_alignment_mode ?? "forcealign"
+  )
+
+  const displayResult: JobResult = (() => {
+    const ar = result.alignment_results
+    if (ar && viewAlignmentMode && ar[viewAlignmentMode]) {
+      const v = ar[viewAlignmentMode]
+      return {
+        ...result,
+        words: v.words,
+        phrases: v.phrases,
+        ultrastar_txt: v.ultrastar_txt,
+      }
+    }
+    return result
+  })()
+
+  const lastSavedPhrasesRef = useRef<typeof displayResult.phrases>(displayResult.phrases)
+  const isDirty = displayResult.phrases !== lastSavedPhrasesRef.current
+
+  useEffect(() => {
+    setViewAlignmentMode(result.current_alignment_mode ?? "forcealign")
+  }, [result.current_alignment_mode])
+
+  useEffect(() => {
+    lastSavedPhrasesRef.current = displayResult.phrases
+  }, [viewAlignmentMode, displayResult.phrases])
 
   // Compute pitch bounds for the display
-  const allNotes = result.phrases.flatMap((p) => p.notes)
+  const allNotes = displayResult.phrases.flatMap((p) => p.notes)
   const minPitch = allNotes.length > 0 ? Math.min(...allNotes.map((n) => n.pitch)) - 6 : -12
   const maxPitch = minPitch + PITCH_RANGE
   const totalBeats = allNotes.length > 0
     ? Math.max(...allNotes.map((n) => n.start_beat + n.duration_beats)) + 20
     : 100
 
-  const gap_s = result.metadata.gap_ms / 1000
-  const ustar_bpm = result.metadata.bpm * 4
+  const variant = result.alignment_results?.[viewAlignmentMode]
+  const gap_ms_effective = variant?.gap_ms ?? result.metadata.gap_ms
+  const gap_s = gap_ms_effective / 1000
+  const ustar_bpm = displayResult.metadata.bpm * 4
   const timeToBeat = (t: number): number => (t - gap_s) * (ustar_bpm / 60)
   const beatToTime = useCallback(
     (beat: number): number => (beat * 60) / ustar_bpm + gap_s,
@@ -88,35 +116,35 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
   const currentBeat = timeToBeat(displayTime)
 
   // Find current phrase: the one containing currentBeat, or between verses the last one we left
-  const getPhraseEndBeat = (phrase: (typeof result.phrases)[number]): number => {
+  const getPhraseEndBeat = (phrase: (typeof displayResult.phrases)[number]): number => {
     const lastNote = phrase.notes[phrase.notes.length - 1]
     return phrase.end_beat > 0
       ? phrase.end_beat
       : (lastNote?.start_beat ?? 0) + (lastNote?.duration_beats ?? 0)
   }
-  const getPhraseStartBeat = (phrase: (typeof result.phrases)[number]): number =>
+  const getPhraseStartBeat = (phrase: (typeof displayResult.phrases)[number]): number =>
     phrase.notes[0]?.start_beat ?? 0
 
   // As soon as we hit the verse-end mark, show the next verse (and its timestamp)
   const displayedPhrase = (() => {
-    const inPhrase = result.phrases.find((phrase) => {
+    const inPhrase = displayResult.phrases.find((phrase) => {
       const phraseStartBeat = getPhraseStartBeat(phrase)
       const phraseEndBeat = getPhraseEndBeat(phrase)
       return currentBeat >= phraseStartBeat && currentBeat <= phraseEndBeat
     })
     if (inPhrase) return inPhrase
-    const nextPhrase = result.phrases.find((p) => getPhraseStartBeat(p) > currentBeat) ?? null
+    const nextPhrase = displayResult.phrases.find((p) => getPhraseStartBeat(p) > currentBeat) ?? null
     if (nextPhrase) return nextPhrase
-    let lastPassed: (typeof result.phrases)[number] | null = null
+    let lastPassed: (typeof displayResult.phrases)[number] | null = null
     let lastEnd = -1
-    for (let i = 0; i < result.phrases.length; i++) {
-      const end = getPhraseEndBeat(result.phrases[i])
+    for (let i = 0; i < displayResult.phrases.length; i++) {
+      const end = getPhraseEndBeat(displayResult.phrases[i])
       if (end <= currentBeat && end > lastEnd) {
         lastEnd = end
-        lastPassed = result.phrases[i]
+        lastPassed = displayResult.phrases[i]
       }
     }
-    return lastPassed ?? result.phrases[0] ?? null
+    return lastPassed ?? displayResult.phrases[0] ?? null
   })()
 
   // Extract words from displayed phrase (next verse as soon as verse-end mark is hit)
@@ -125,7 +153,7 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
     : ""
 
   // Match phrase words to timestamped words by finding words that overlap with phrase time range
-  const phraseWords = displayedPhrase && result.words.length > 0 && phraseText
+  const phraseWords = displayedPhrase && displayResult.words.length > 0 && phraseText
     ? (() => {
         const phraseStartTime = beatToTime(getPhraseStartBeat(displayedPhrase))
         const lastNote = displayedPhrase.notes[displayedPhrase.notes.length - 1]
@@ -134,7 +162,7 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
             ? displayedPhrase.end_beat
             : (lastNote?.start_beat ?? 0) + (lastNote?.duration_beats ?? 0)
         )
-        const wordsInRange = result.words
+        const wordsInRange = displayResult.words
           .filter((w) => w.start >= phraseStartTime - 0.2 && w.end <= phraseEndTime + 0.2)
           .sort((a, b) => a.start - b.start)
         return wordsInRange
@@ -161,8 +189,8 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
 
   const totalDuration = audioDuration > 0
     ? audioDuration
-    : result.words.length > 0
-      ? Math.max(...result.words.map((w) => w.end)) + 1
+    : displayResult.words.length > 0
+      ? Math.max(...displayResult.words.map((w) => w.end)) + 1
       : 60
 
   const updateTimeFromMouse = useCallback(
@@ -365,7 +393,7 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
     }
 
     // Draw notes
-    result.phrases.forEach((phrase, pIdx) => {
+    displayResult.phrases.forEach((phrase, pIdx) => {
       phrase.notes.forEach((note, nIdx) => {
         const x = note.start_beat * PIXELS_PER_BEAT
         const y = (maxPitch - note.pitch) * ROW_HEIGHT
@@ -417,7 +445,7 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
       ctx.lineTo(playheadX, height)
       ctx.stroke()
     }
-  }, [result.phrases, selectedNote, minPitch, maxPitch, totalBeats, displayTime, currentBeat])
+  }, [displayResult.phrases, selectedNote, minPitch, maxPitch, totalBeats, displayTime, currentBeat])
 
   // Handle clicking on canvas to select notes
   const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -432,8 +460,8 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
     const clickedBeat = x / PIXELS_PER_BEAT
     const clickedPitch = maxPitch - Math.floor(y / ROW_HEIGHT)
 
-    for (let pIdx = 0; pIdx < result.phrases.length; pIdx++) {
-      const phrase = result.phrases[pIdx]
+    for (let pIdx = 0; pIdx < displayResult.phrases.length; pIdx++) {
+      const phrase = displayResult.phrases[pIdx]
       for (let nIdx = 0; nIdx < phrase.notes.length; nIdx++) {
         const note = phrase.notes[nIdx]
         if (
@@ -447,7 +475,7 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
       }
     }
     setSelectedNote(null)
-  }, [result.phrases, maxPitch])
+  }, [displayResult.phrases, maxPitch])
 
   const updateEditorAnchor = useCallback((): void => {
     if (!selectedNote || !canvasRef.current) {
@@ -456,7 +484,7 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
     }
     const canvas = canvasRef.current
     const rect = canvas.getBoundingClientRect()
-    const note = result.phrases[selectedNote.phraseIdx]?.notes[selectedNote.noteIdx]
+    const note = displayResult.phrases[selectedNote.phraseIdx]?.notes[selectedNote.noteIdx]
     if (!note) {
       setEditorAnchor(null)
       return
@@ -473,7 +501,7 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
       width: w * scaleX,
       height: h * scaleY,
     })
-  }, [selectedNote, result.phrases, maxPitch])
+  }, [selectedNote, displayResult.phrases, maxPitch])
 
   useLayoutEffect(() => {
     updateEditorAnchor()
@@ -493,21 +521,21 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
 
   const updateNote = useCallback((field: keyof UltraStarNote, value: string | number) => {
     if (!selectedNote) return
-    const newPhrases = structuredClone(result.phrases)
+    const newPhrases = structuredClone(displayResult.phrases)
     const note = newPhrases[selectedNote.phraseIdx].notes[selectedNote.noteIdx]
     ;(note as Record<keyof UltraStarNote, string | number>)[field] = value
     onResultChange({ ...result, phrases: newPhrases })
-  }, [selectedNote, result, onResultChange])
+  }, [selectedNote, result, onResultChange, displayResult.phrases])
 
   const handleSave = useCallback(async () => {
     setSaving(true)
     try {
-      await updateNotes(jobId, result.phrases)
-      lastSavedPhrasesRef.current = result.phrases
+      await updateNotes(jobId, displayResult.phrases)
+      lastSavedPhrasesRef.current = displayResult.phrases
     } finally {
       setSaving(false)
     }
-  }, [jobId, result.phrases])
+  }, [jobId, displayResult.phrases])
 
   const togglePlayback = useCallback(() => {
     const audio = audioRef.current
@@ -544,7 +572,7 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
   }, [])
 
   const sel = selectedNote
-    ? result.phrases[selectedNote.phraseIdx]?.notes[selectedNote.noteIdx]
+    ? displayResult.phrases[selectedNote.phraseIdx]?.notes[selectedNote.noteIdx]
     : null
 
   const handleSeekKeyDown = useCallback(
@@ -580,14 +608,35 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
       <EditorHeader
         result={result}
         allNotesCount={allNotes.length}
-        phrasesCount={result.phrases.length}
+        phrasesCount={displayResult.phrases.length}
         showSettings={showSettings}
         onToggleSettings={() => setShowSettings((s) => !s)}
         saving={saving}
         isDirty={isDirty}
         onSave={handleSave}
-        onExport={onExport}
+        onExport={() => onExport(viewAlignmentMode)}
       />
+
+      {result.alignment_results && Object.keys(result.alignment_results).length > 1 && (
+        <div className="flex items-center gap-3 flex-wrap">
+          <span className="text-sm text-zinc-400">View alignment:</span>
+          <select
+            value={viewAlignmentMode}
+            onChange={(e) => setViewAlignmentMode(e.target.value)}
+            className="bg-zinc-800 border border-zinc-600 rounded-lg px-3 py-1.5 text-white text-sm
+                       focus:outline-none focus:border-violet-500"
+          >
+            {Object.keys(result.alignment_results).map((mode) => (
+              <option key={mode} value={mode}>
+                {mode}
+              </option>
+            ))}
+          </select>
+          <span className="text-xs text-zinc-500">
+            Switch instantly between alignments generated for this song.
+          </span>
+        </div>
+      )}
 
       {showSettings && (
         <LyricsSettingsPanel
@@ -684,9 +733,9 @@ export const Editor = ({ jobId, result, onResultChange, onExport }: EditorProps)
 
       {!selectedNote && <EditorHint />}
 
-      <LyricsPreviewSection phrases={result.phrases} />
+      <LyricsPreviewSection phrases={displayResult.phrases} />
 
-      <RawUltrastarSection ultrastarTxt={result.ultrastar_txt} />
+      <RawUltrastarSection ultrastarTxt={displayResult.ultrastar_txt} />
     </div>
   )
 }

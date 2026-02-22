@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 from dataclasses import dataclass
 
 import librosa
@@ -35,10 +36,7 @@ class LyricsParams:
     min_word_confidence: float = 0.15
     audio_source: str = "original"  # "vocals" | "original"
     normalize: bool = True
-    # "qwen3" = Qwen3-ForcedAligner (11 langs) with NeMo fallback; "proportional" = spread evenly
-    alignment_mode: str = "qwen3"
-    # Seconds to skip at start when using proportional (intro)
-    lyrics_start_offset: float = 2.0
+    alignment_mode: str = "forcealign"
 
 
 def _get_model(model_size: str = "medium") -> WhisperModel:
@@ -131,6 +129,36 @@ def _clean_lyrics_line(t: str) -> str:
     return re.sub(r"\[[^\]]*\]|\(x\d+\)", " ", t, flags=re.IGNORECASE)
 
 
+_PUNCTUATION_STRIP = re.compile(r"^[\s.,!?…\-–—:;\"'()\[\]♪♫#*]+|[\s.,!?…\-–—:;\"'()\[\]♪♫#*]+$")
+
+
+def _normalize_word_for_alignment(w: str) -> str:
+    """Strip leading/trailing punctuation for aligner tokenization."""
+    return _PUNCTUATION_STRIP.sub("", w).strip()
+
+
+def preprocess_lyrics_for_alignment(lyrics_text: str) -> tuple[list[list[str]], list[str], list[int]]:
+    """Single preprocessing pipeline for all aligners. Returns (lines, all_words, line_breaks)."""
+    lines: list[list[str]] = []
+    all_words: list[str] = []
+    line_breaks: list[int] = []
+    idx = 0
+    for raw_line in lyrics_text.splitlines():
+        if not raw_line.strip():
+            continue
+        cleaned = _clean_lyrics_line(raw_line)
+        words = [_normalize_word_for_alignment(w) for w in cleaned.split() if w]
+        words = [w for w in words if w]
+        if not words:
+            continue
+        if idx > 0:
+            line_breaks.append(idx)
+        lines.append(words)
+        all_words.extend(words)
+        idx += len(words)
+    return (lines, all_words, line_breaks)
+
+
 def _normalize_lang_code(language: str | None) -> str:
     """Normalize to ISO 639-1 two-letter code; fix common mistakes (e.g. po -> pl for Polish)."""
     if not language or not language.strip():
@@ -141,141 +169,42 @@ def _normalize_lang_code(language: str | None) -> str:
     return code[:2] if len(code) >= 2 else "en"
 
 
-# Qwen3-ForcedAligner supports 11 languages; ISO-2 code -> Qwen3 language name
-QWEN3_LANGUAGES: dict[str, str] = {
-    "en": "English",
-    "zh": "Chinese",
-    "yue": "Cantonese",
-    "fr": "French",
-    "de": "German",
-    "it": "Italian",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "pt": "Portuguese",
-    "ru": "Russian",
-    "es": "Spanish",
-}
-QWEN3_MAX_DURATION_SEC = 300.0  # 5 minutes per align() call
-
-_qwen3_aligner_cache: object | None = None
-
-
-def extract_lyrics_qwen3(
-    audio_path: str,
-    lyrics_text: str,
-    language: str | None = None,
-) -> tuple[list[Word], list[int]] | tuple[None, str]:
-    """Use Qwen3-ForcedAligner for precise word-level forced alignment. 11 languages.
-
-    Returns (words, line_breaks) on success, or (None, reason) if unavailable/fails.
-    Chunks at line breaks when audio exceeds 5 minutes.
-    """
-    try:
-        import torch
-        from qwen_asr import Qwen3ForcedAligner
-    except ImportError as e:
-        reason = f"qwen-asr not installed (pip install qwen-asr): {e}"
-        log.info("%s", reason)
-        return None, reason
-
-    lines = [[w for w in _clean_lyrics_line(ln).split() if w] for ln in lyrics_text.splitlines() if ln.strip()]
-    all_words = [w for line in lines for w in line]
-    if not all_words:
-        return None, "No lyrics words after cleaning"
-
-    lang_code = _normalize_lang_code(language)
-    qwen3_lang = QWEN3_LANGUAGES.get(lang_code)
-    if not qwen3_lang:
-        return None, f"Qwen3 does not support language {lang_code}"
-
-    global _qwen3_aligner_cache
-    if _qwen3_aligner_cache is None:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        log.info("Loading Qwen3-ForcedAligner on %s", device)
-        _qwen3_aligner_cache = Qwen3ForcedAligner.from_pretrained(
-            "Qwen/Qwen3-ForcedAligner-0.6B",
-            dtype=torch.bfloat16,
-            device_map=device,
-        )
-        log.info("Qwen3-ForcedAligner loaded")
-    model = _qwen3_aligner_cache
-
-    duration = librosa.get_duration(path=audio_path)
-    line_breaks: list[int] = []
-    idx = 0
-    for line in lines:
-        if idx > 0:
-            line_breaks.append(idx)
-        idx += len(line)
-
-    if duration <= QWEN3_MAX_DURATION_SEC:
-        transcript = " ".join(all_words)
-        try:
-            results = model.align(audio=audio_path, text=transcript, language=qwen3_lang)
-        except Exception as e:
-            reason = str(e)
-            log.warning("Qwen3 align failed (%s)", reason)
-            return None, reason
-        if not results or not results[0]:
-            return None, "Qwen3 returned no alignments"
-        words = [
-            Word(text=w.text, start=float(w.start_time), end=float(w.end_time), confidence=1.0)
-            for w in results[0]
-        ]
-        if len(words) != len(all_words):
-            log.warning("Qwen3 word count %d != lyrics %d; using lyrics text", len(words), len(all_words))
-            words = _qwen3_words_to_lyrics_order(results[0], all_words)
-        log.info("Qwen3 produced %d words with %d line breaks", len(words), len(line_breaks))
-        return (words, line_breaks)
-
-    # Chunk by time: proportional word ranges per ~5 min segment
-    n_chunks = max(1, int(duration / QWEN3_MAX_DURATION_SEC) + (1 if duration % QWEN3_MAX_DURATION_SEC > 0 else 0))
-    chunk_dur = duration / n_chunks
-    words_out: list[Word] = []
-    for i in range(n_chunks):
-        t_start = i * chunk_dur
-        t_end = min((i + 1) * chunk_dur, duration)
-        w_start = int(i * len(all_words) / n_chunks)
-        w_end = int((i + 1) * len(all_words) / n_chunks) if i < n_chunks - 1 else len(all_words)
-        if w_start >= w_end:
-            continue
-        chunk_text = " ".join(all_words[w_start:w_end])
-        overlap = 1.0
-        load_start = max(0.0, t_start - overlap)
-        load_dur = (t_end - load_start) + overlap
-        try:
-            y, sr = librosa.load(audio_path, sr=16000, mono=True, offset=load_start, duration=load_dur)
-        except Exception as e:
-            log.warning("Qwen3 chunk load failed (%s)", e)
-            return None, str(e)
-        try:
-            results = model.align(audio=(y, sr), text=chunk_text, language=qwen3_lang)
-        except Exception as e:
-            reason = str(e)
-            log.warning("Qwen3 chunk align failed (%s)", reason)
-            return None, reason
-        if not results or not results[0]:
-            return None, "Qwen3 returned no alignments for chunk"
-        chunk_lyrics = all_words[w_start:w_end]
-        for j, w in enumerate(results[0]):
-            lw = chunk_lyrics[j] if j < len(chunk_lyrics) else w.text
-            words_out.append(Word(text=lw, start=float(w.start_time) + load_start, end=float(w.end_time) + load_start, confidence=1.0))
-    if len(words_out) != len(all_words):
-        log.warning("Qwen3 chunked word count %d != lyrics %d", len(words_out), len(all_words))
-    log.info("Qwen3 (chunked) produced %d words with %d line breaks", len(words_out), len(line_breaks))
-    return (words_out, line_breaks)
-
-
-def _qwen3_words_to_lyrics_order(aligned: list, lyrics_words: list[str]) -> list[Word]:
-    """Map Qwen3 output to lyrics word order when counts differ."""
+def _aligner_words_to_lyrics_order(aligned: list, lyrics_words: list[str]) -> list[Word]:
+    """Map aligner output to lyrics word order; use normalized match when counts differ."""
     if not aligned:
         return [Word(text=w, start=0.0, end=0.0, confidence=0.0) for w in lyrics_words]
+    if len(aligned) == len(lyrics_words):
+        return [
+            Word(text=lw, start=float(w.start_time), end=float(w.end_time), confidence=1.0)
+            for lw, w in zip(lyrics_words, aligned)
+        ]
+    # Match by normalized text in a small window
+    def norm(s: str) -> str:
+        return _normalize_word_for_alignment(s).lower()
+
     out: list[Word] = []
     ai = 0
+    window = 3
     for i, lw in enumerate(lyrics_words):
-        if ai < len(aligned):
-            w = aligned[ai]
+        best_j = -1
+        best_score = -1
+        for j in range(ai, min(ai + window, len(aligned))):
+            aw = getattr(aligned[j], "text", str(aligned[j]))
+            if norm(aw) == norm(lw):
+                best_j = j
+                best_score = 2
+                break
+            if norm(aw) in norm(lw) or norm(lw) in norm(aw):
+                if best_score < 1:
+                    best_score = 1
+                    best_j = j
+        if best_j >= 0:
+            w = aligned[best_j]
             out.append(Word(text=lw, start=float(w.start_time), end=float(w.end_time), confidence=1.0))
+            ai = best_j + 1
+        elif ai < len(aligned):
+            w = aligned[ai]
+            out.append(Word(text=lw, start=float(w.start_time), end=float(w.end_time), confidence=0.7))
             ai += 1
         else:
             t = out[-1].end + 0.2 if out else 0.0
@@ -309,8 +238,7 @@ def extract_lyrics_nemo(
         log.info("%s", reason)
         return None, reason
 
-    lines = [[w for w in _clean_lyrics_line(ln).split() if w] for ln in lyrics_text.splitlines() if ln.strip()]
-    all_words = [w for line in lines for w in line]
+    lines, all_words, _line_breaks_pre = preprocess_lyrics_for_alignment(lyrics_text)
     if not all_words:
         return None, "No lyrics words after cleaning"
 
@@ -349,12 +277,7 @@ def extract_lyrics_nemo(
     word_ts = hyp.timestamp["word"]
     asr_words = (hyp.text or "").split()
 
-    line_breaks = []
-    idx = 0
-    for line in lines:
-        if idx > 0:
-            line_breaks.append(idx)
-        idx += len(line)
+    line_breaks = _line_breaks_pre
 
     if not asr_words or not word_ts:
         return None, "NeMo returned empty words or timestamps"
@@ -386,40 +309,357 @@ def _nemo_ts_to_sec(ts: object, model: object) -> tuple[float, float]:
     return (0.0, 0.2)
 
 
-def extract_lyrics_proportional(
+def extract_lyrics_forcealign(
     audio_path: str,
     lyrics_text: str,
-    start_offset: float = 2.0,
-) -> tuple[list[Word], list[int]]:
-    """Distribute lyrics proportionally across audio duration. No Whisper.
+    language: str | None = None,
+) -> tuple[list[Word], list[int]] | tuple[None, str]:
+    """ForceAlign (pip install forcealign): English, word-level. Returns (words, line_breaks) or (None, reason)."""
+    try:
+        from forcealign import ForceAlign
+        import nltk
+        import os
+        nltk_data_dir = os.path.join(os.path.dirname(__file__), "..", "nltk_data")
+        os.makedirs(nltk_data_dir, exist_ok=True)
+        if nltk_data_dir not in nltk.data.path:
+            nltk.data.path.insert(0, nltk_data_dir)
+        nltk.download("averaged_perceptron_tagger_eng", quiet=True, download_dir=nltk_data_dir)
+    except ImportError as e:
+        return None, f"forcealign not installed (pip install forcealign): {e}"
 
-    Words are spread evenly from start_offset to end. Line breaks preserved.
-    """
-    duration = librosa.get_duration(path=audio_path)
-    t_start = min(start_offset, duration * 0.1)
-    t_end = duration
-    effective = max(0.1, t_end - t_start)
-
-    lines = [[w for w in _clean_lyrics_line(ln).split() if w] for ln in lyrics_text.splitlines() if ln.strip()]
-    all_words = [w for line in lines for w in line]
+    lines, all_words, line_breaks = preprocess_lyrics_for_alignment(lyrics_text)
     if not all_words:
-        return [], []
+        return None, "No lyrics words after cleaning"
+    lang = _normalize_lang_code(language)
+    if lang != "en":
+        return None, "ForceAlign supports English only"
 
-    n_total = len(all_words)
-    words: list[Word] = []
-    line_breaks: list[int] = []
-    idx = 0
-    for line in lines:
-        if idx > 0:
-            line_breaks.append(idx)
-        n_line = len(line)
-        for i in range(n_line):
-            frac = (idx + i) / n_total
-            next_frac = (idx + i + 1) / n_total
-            t_s = t_start + frac * effective
-            t_e = t_start + next_frac * effective
-            words.append(Word(text=line[i], start=t_s, end=t_e, confidence=0))
-        idx += n_line
+    transcript = " ".join(all_words)
+    try:
+        align = ForceAlign(audio_file=audio_path, transcript=transcript)
+        raw_words = align.inference()
+    except Exception as e:
+        log.warning("ForceAlign failed: %s", e)
+        return None, str(e)
+    if not raw_words:
+        return None, "ForceAlign returned no words"
 
-    log.info("Proportional: %d words across %.1f–%.1fs (%d line breaks)", len(words), t_start, t_end, len(line_breaks))
-    return words, line_breaks
+    class _AlignerWord:
+        def __init__(self, w: object) -> None:
+            self.text = getattr(w, "word", str(w))
+            self.start_time = float(getattr(w, "time_start", 0))
+            self.end_time = float(getattr(w, "time_end", 0))
+
+    words = [Word(text=_AlignerWord(w).text, start=_AlignerWord(w).start_time, end=_AlignerWord(w).end_time, confidence=1.0) for w in raw_words]
+    if len(words) == len(all_words):
+        words = [
+            Word(text=all_words[i], start=w.start, end=w.end, confidence=w.confidence)
+            for i, w in enumerate(words)
+        ]
+    elif len(words) != len(all_words):
+        log.warning("ForceAlign word count %d != lyrics %d; mapping", len(words), len(all_words))
+        words = _aligner_words_to_lyrics_order([_AlignerWord(w) for w in raw_words], all_words)
+    log.info("ForceAlign produced %d words, %d line breaks", len(words), len(line_breaks))
+    return (words, line_breaks)
+
+
+def extract_lyrics_aeneas(
+    audio_path: str,
+    lyrics_text: str,
+    language: str | None = None,
+) -> tuple[list[Word], list[int]] | tuple[None, str]:
+    """aeneas (pip install aeneas): word-level sync. Returns (words, line_breaks) or (None, reason)."""
+    try:
+        from aeneas.executetask import ExecuteTask
+        from aeneas.task import Task
+    except ImportError as e:
+        return None, f"aeneas not installed (pip install aeneas): {e}"
+
+    lines, all_words, line_breaks = preprocess_lyrics_for_alignment(lyrics_text)
+    if not all_words:
+        return None, "No lyrics words after cleaning"
+
+    try:
+        import json
+        import os
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w", encoding="utf-8") as f:
+            for w in all_words:
+                f.write(w + "\n")
+            txt_path = f.name
+        task = Task(config_string="task_language=eng|is_text_type=plain|os_task_file_format=json")
+        task.audio_file_path_absolute = audio_path
+        task.text_file_path_absolute = txt_path
+        task.sync_map_file_path_absolute = txt_path + ".json"
+        ExecuteTask(task).execute()
+        with open(task.sync_map_file_path_absolute, encoding="utf-8") as fp:
+            data = json.load(fp)
+        fragments = data.get("fragments", [])
+        words_out: list[Word] = []
+        for i, frag in enumerate(fragments):
+            if i >= len(all_words):
+                break
+            begin = float(frag.get("begin", 0))
+            end = float(frag.get("end", 0))
+            words_out.append(Word(text=all_words[i], start=begin, end=end, confidence=1.0))
+        while len(words_out) < len(all_words):
+            t = words_out[-1].end + 0.2 if words_out else 0.0
+            words_out.append(Word(text=all_words[len(words_out)], start=t, end=t + 0.3, confidence=0.0))
+        try:
+            os.unlink(txt_path)
+            os.unlink(task.sync_map_file_path_absolute)
+        except Exception:
+            pass
+        log.info("aeneas produced %d words, %d line breaks", len(words_out), len(line_breaks))
+        return (words_out, line_breaks)
+    except Exception as e:
+        log.warning("aeneas failed: %s", e)
+        return None, str(e)
+
+
+def extract_lyrics_whisperx(
+    audio_path: str,
+    lyrics_text: str,
+    language: str | None = None,
+) -> tuple[list[Word], list[int]] | tuple[None, str]:
+    """WhisperX: fixed transcript via dummy segment then align. Returns (words, line_breaks) or (None, reason)."""
+    try:
+        import whisperx
+        import torch
+    except ImportError as e:
+        return None, f"whisperx not installed (pip install whisperx): {e}"
+
+    lines, all_words, line_breaks = preprocess_lyrics_for_alignment(lyrics_text)
+    if not all_words:
+        return None, "No lyrics words after cleaning"
+
+    lang_code = _normalize_lang_code(language)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        audio = whisperx.load_audio(audio_path)
+        duration_sec = len(audio) / 16000
+        transcript = " ".join(all_words)
+        segments = [{"start": 0.0, "end": duration_sec, "text": transcript}]
+        model_a, metadata = whisperx.load_align_model(language_code=lang_code, device=device)
+        aligned = whisperx.align(segments, model_a, metadata, audio, device, return_char_alignments=False)
+    except Exception as e:
+        log.warning("WhisperX failed: %s", e)
+        return None, str(e)
+    if not aligned or "segments" not in aligned:
+        return None, "WhisperX align returned no segments"
+    words_out: list[Word] = []
+    for seg in aligned["segments"]:
+        for w in seg.get("words", []):
+            words_out.append(Word(text=w.get("word", ""), start=float(w.get("start", 0)), end=float(w.get("end", 0)), confidence=1.0))
+    if len(words_out) == len(all_words):
+        words_out = [
+            Word(text=all_words[i], start=w.start, end=w.end, confidence=w.confidence)
+            for i, w in enumerate(words_out)
+        ]
+    elif len(words_out) != len(all_words):
+        class _W:
+            def __init__(self, text: str, start_time: float, end_time: float):
+                self.text = text
+                self.start_time = start_time
+                self.end_time = end_time
+        words_out = _aligner_words_to_lyrics_order(
+            [_W(w.text, w.start, w.end) for w in words_out],
+            all_words,
+        )
+    log.info("WhisperX produced %d words, %d line breaks", len(words_out), len(line_breaks))
+    return (words_out, line_breaks)
+
+
+def extract_lyrics_mfa(
+    audio_path: str,
+    lyrics_text: str,
+    language: str | None = None,
+) -> tuple[list[Word], list[int]] | tuple[None, str]:
+    """Montreal Forced Aligner (pip install Montreal-Forced-Aligner): CLI align. Returns (words, line_breaks) or (None, reason)."""
+    try:
+        import os
+        import subprocess
+        import tempfile
+        from pathlib import Path
+    except ImportError:
+        return None, "Montreal-Forced-Aligner not available"
+
+    lines, all_words, line_breaks = preprocess_lyrics_for_alignment(lyrics_text)
+    if not all_words:
+        return None, "No lyrics words after cleaning"
+
+    with tempfile.TemporaryDirectory(prefix="mfa_") as tmp:
+        corpus = Path(tmp) / "corpus"
+        corpus.mkdir()
+        utt_dir = corpus / "1"
+        utt_dir.mkdir()
+        audio_link = utt_dir / "utt.wav"
+        try:
+            import shutil
+            shutil.copy2(audio_path, audio_link)
+        except Exception as e:
+            return None, str(e)
+        with open(utt_dir / "utt.lab", "w", encoding="utf-8") as f:
+            f.write(" ".join(all_words))
+        out_dir = Path(tmp) / "out"
+        out_dir.mkdir()
+        try:
+            subprocess.run(
+                ["mfa", "align", str(corpus), "english_us_arpa", "english_us_arpa", str(out_dir), "--clean"],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            return None, f"MFA align failed: {e.stderr or e.stdout}"
+        except FileNotFoundError:
+            return None, "mfa CLI not found (pip install Montreal-Forced-Aligner)"
+        except subprocess.TimeoutExpired:
+            return None, "MFA timed out"
+        textgrid = out_dir / "1" / "utt.TextGrid"
+        if not textgrid.exists():
+            return None, "MFA produced no TextGrid"
+        try:
+            with open(textgrid, encoding="utf-8") as f:
+                content = f.read()
+            words_out = _parse_mfa_textgrid(content, all_words)
+        except Exception as e:
+            return None, str(e)
+    log.info("MFA produced %d words, %d line breaks", len(words_out), len(line_breaks))
+    return (words_out, line_breaks)
+
+
+def _parse_mfa_textgrid(content: str, lyrics_words: list[str]) -> list[Word]:
+    """Parse Praat TextGrid word tier into Word list."""
+    import re
+    intervals = re.findall(r"intervals \[.*?\]:\s*xmin = ([\d.]+)\s*xmax = ([\d.]+)\s*text = \"([^\"]*)\"", content, re.DOTALL)
+    words_out: list[Word] = []
+    for i, (xmin, xmax, text) in enumerate(intervals):
+        if not text.strip():
+            continue
+        lw = lyrics_words[len(words_out)] if len(words_out) < len(lyrics_words) else text.strip()
+        words_out.append(Word(text=lw, start=float(xmin), end=float(xmax), confidence=1.0))
+    while len(words_out) < len(lyrics_words):
+        t = words_out[-1].end + 0.2 if words_out else 0.0
+        words_out.append(Word(text=lyrics_words[len(words_out)], start=t, end=t + 0.3, confidence=0.0))
+    return words_out[: len(lyrics_words)]
+
+
+def extract_lyrics_gentle(
+    audio_path: str,
+    lyrics_text: str,
+    language: str | None = None,
+) -> tuple[list[Word], list[int]] | tuple[None, str]:
+    """Gentle (Docker/API): POST to Gentle service. Returns (words, line_breaks) or (None, reason)."""
+    try:
+        import urllib.request
+        import urllib.error
+        import json
+    except ImportError:
+        return None, "urllib not available"
+
+    lines, all_words, line_breaks = preprocess_lyrics_for_alignment(lyrics_text)
+    if not all_words:
+        return None, "No lyrics words after cleaning"
+
+    url = "http://localhost:8765/transcribe"
+    transcript = " ".join(all_words)
+    try:
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+        boundary = "----FormBoundaryKaraokeCreator"
+        body_parts = [
+            b"--" + boundary.encode(),
+            b'Content-Disposition: form-data; name="audio"; filename="audio.wav"',
+            b"Content-Type: audio/wav",
+            b"",
+            audio_data,
+            b"--" + boundary.encode(),
+            b'Content-Disposition: form-data; name="transcript"',
+            b"",
+            transcript.encode("utf-8"),
+            b"--" + boundary.encode() + b"--",
+        ]
+        req = urllib.request.Request(
+            url,
+            data=b"\r\n".join(body_parts),
+            method="POST",
+        )
+        req.add_header("Content-Type", "multipart/form-data; boundary=" + boundary)
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.URLError as e:
+        return None, f"Gentle not reachable (run Docker: lowerquality/gentle): {e}"
+    except Exception as e:
+        return None, str(e)
+    words_json = data.get("words", [])
+    words_out: list[Word] = []
+    for i, w in enumerate(words_json):
+        lw = all_words[i] if i < len(all_words) else w.get("word", "")
+        words_out.append(Word(text=lw, start=float(w.get("start", 0)), end=float(w.get("end", 0)), confidence=1.0))
+    while len(words_out) < len(all_words):
+        t = words_out[-1].end + 0.2 if words_out else 0.0
+        words_out.append(Word(text=all_words[len(words_out)], start=t, end=t + 0.3, confidence=0.0))
+    log.info("Gentle produced %d words, %d line breaks", len(words_out), len(line_breaks))
+    return (words_out[: len(all_words)], line_breaks)
+
+
+def extract_lyrics_autolyrixalign(
+    audio_path: str,
+    lyrics_text: str,
+    language: str | None = None,
+) -> tuple[list[Word], list[int]] | tuple[None, str]:
+    """AutoLyrixAlign (Karaokeer Docker or script): optional. Returns (words, line_breaks) or (None, reason)."""
+    import os
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    lines, all_words, line_breaks = preprocess_lyrics_for_alignment(lyrics_text)
+    if not all_words:
+        return None, "No lyrics words after cleaning"
+
+    root = os.environ.get("AUTOLYRIXALIGN_ROOT")
+    if not root or not os.path.isdir(root):
+        return None, "AUTOLYRIXALIGN_ROOT not set (download from NUS AutoLyrixAlign, extract, set env)"
+    script = os.path.join(root, "align.py")
+    if not os.path.isfile(script):
+        return None, "AUTOLYRIXALIGN_ROOT has no align.py"
+    with tempfile.TemporaryDirectory(prefix="ala_") as tmp:
+        txt_path = os.path.join(tmp, "lyrics.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(" ".join(line) + "\n")
+        out_path = os.path.join(tmp, "out.txt")
+        try:
+            subprocess.run(
+                [sys.executable, script, audio_path, txt_path, out_path],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=True,
+            )
+        except Exception as e:
+            return None, str(e)
+        if not os.path.isfile(out_path):
+            return None, "AutoLyrixAlign produced no output"
+        words_out = []
+        with open(out_path, encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) >= 3:
+                    words_out.append(Word(text=parts[2], start=float(parts[0]), end=float(parts[1]), confidence=1.0))
+        # Always use our lyrics words for text so Unicode (e.g. Polish ą, ę, ł) is preserved
+        if len(words_out) == len(all_words):
+            words_out = [
+                Word(text=all_words[i], start=w.start, end=w.end, confidence=w.confidence)
+                for i, w in enumerate(words_out)
+            ]
+        else:
+            words_out = _aligner_words_to_lyrics_order(
+                [type("W", (), {"text": w.text, "start_time": w.start, "end_time": w.end})() for w in words_out],
+                all_words,
+            )
+    return (words_out, line_breaks)

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { useParams, useNavigate } from "react-router-dom"
+import { useParams, useNavigate, useLocation } from "react-router-dom"
 import type { JobResult } from "../types"
 import { getResult } from "../api"
 import { Export } from "../components/Export"
@@ -7,6 +7,8 @@ import { Export } from "../components/Export"
 export const ExportPage = () => {
   const { jobId } = useParams<{ jobId: string }>()
   const navigate = useNavigate()
+  const location = useLocation()
+  const alignmentMode = (location.state as { alignmentMode?: string } | null)?.alignmentMode
   const [result, setResult] = useState<JobResult | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -61,6 +63,7 @@ export const ExportPage = () => {
     <Export
       jobId={jobId!}
       result={result}
+      alignmentMode={alignmentMode}
       onBack={() => navigate(`/editor/${jobId}`)}
       onStartOver={() => navigate("/")}
     />
