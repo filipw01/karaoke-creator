@@ -1,3 +1,4 @@
+import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core"
 import type {
   AlignmentRun,
   AudioTrack,
@@ -16,6 +17,14 @@ const apiHeaders = (json = false): Record<string, string> => ({
   ...(API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {}),
 })
 const authQuery = API_TOKEN ? `?access_token=${encodeURIComponent(API_TOKEN)}` : ""
+
+const invokeDesktop = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+  try {
+    return await invoke<T>(command, args)
+  } catch (error) {
+    throw error instanceof Error ? error : new Error(String(error))
+  }
+}
 
 export const uploadFile = async (
   file: File,
@@ -247,17 +256,79 @@ export interface SongListItem {
   queue_position?: number
 }
 
-export const listSongs = async (): Promise<{ working_directory: string | null; songs: Array<SongListItem> }> => {
+interface SongLibrary {
+  working_directory: string | null
+  songs: Array<SongListItem>
+}
+
+interface ManagedLibrary extends SongLibrary {
+  published_paths: string[]
+}
+
+let sharedDevelopmentLibrary = false
+
+const listHttpSongs = async (): Promise<SongLibrary> => {
   const res = await fetch(`${BASE}/library`, { headers: apiHeaders() })
   if (!res.ok) throw new Error("Failed to list songs")
   return res.json()
 }
 
+const listManagedSongs = async (): Promise<ManagedLibrary> => {
+  const res = await fetch(`${BASE}/library?managed_only=true`, {
+    headers: apiHeaders(),
+    signal: AbortSignal.timeout(1500),
+  })
+  if (!res.ok) throw new Error("Failed to list managed songs")
+  const library: ManagedLibrary = await res.json()
+  return { ...library, songs: library.songs.filter((song) => song.kind === "managed") }
+}
+
+export const listSongs = async (): Promise<SongLibrary> => {
+  if (!isTauri()) return listHttpSongs()
+  const [nativeLibrary, managed] = await Promise.all([
+    invokeDesktop<SongLibrary>("list_native_songs"),
+    import.meta.env.DEV ? listManagedSongs().catch(() => undefined) : undefined,
+  ])
+  let library = nativeLibrary
+  if (!library.working_directory && managed?.working_directory) {
+    try {
+      await invokeDesktop("set_native_library_directory", { directory: managed.working_directory })
+      library = await invokeDesktop("list_native_songs")
+    } catch {
+      // A legacy selection may point to a directory that no longer exists.
+    }
+  }
+  sharedDevelopmentLibrary = !!library.working_directory && library.working_directory === managed?.working_directory
+  const published = new Set(sharedDevelopmentLibrary ? managed?.published_paths : [])
+  return {
+    working_directory: library.working_directory,
+    songs: [...(managed?.songs ?? []), ...library.songs.filter((song) => !published.has(song.path ?? ""))],
+  }
+}
+
+export const pickWorkingDirectory = (): Promise<string | null> =>
+  invokeDesktop("pick_native_library_directory")
+
 export const setWorkingDirectory = async (directory: string): Promise<string> => {
+  if (isTauri()) {
+    if (import.meta.env.DEV) {
+      try {
+        directory = await setHttpWorkingDirectory(directory, AbortSignal.timeout(1500))
+      } catch {
+        // Rust can save the selection without the development API.
+      }
+    }
+    return invokeDesktop("set_native_library_directory", { directory })
+  }
+  return setHttpWorkingDirectory(directory)
+}
+
+const setHttpWorkingDirectory = async (directory: string, signal?: AbortSignal): Promise<string> => {
   const res = await fetch(`${BASE}/library/working-directory`, {
     method: "PUT",
     headers: apiHeaders(true),
     body: JSON.stringify({ directory }),
+    signal,
   })
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: "Unable to set working directory" }))
@@ -274,6 +345,8 @@ export interface ExternalSong {
   metadata: SongMetadata
   phrases: JobResult["phrases"]
   audio_available: boolean
+  playback_url?: string
+  separation_available: boolean
   stems_available: boolean
   separation_status: ExternalSongSeparationStatus["status"]
   separation_error?: string
@@ -285,6 +358,26 @@ export interface ExternalSongSeparationStatus {
 }
 
 export const getExternalSong = async (path: string): Promise<ExternalSong> => {
+  if (isTauri()) {
+    type NativeSong = Pick<ExternalSong, "path" | "filename" | "content" | "metadata" | "phrases" | "audio_available"> & {
+      playback_path: string | null
+    }
+    const [song, separation] = await Promise.all([
+      invokeDesktop<NativeSong>("open_external_chart", { path }),
+      sharedDevelopmentLibrary
+        ? getExternalSongSeparationStatus(path, AbortSignal.timeout(1500)).catch(() => undefined)
+        : undefined,
+    ])
+    const { playback_path: playbackPath, ...chart } = song
+    return {
+      ...chart,
+      playback_url: playbackPath ? convertFileSrc(playbackPath) : undefined,
+      separation_available: separation !== undefined,
+      stems_available: separation?.status === "done",
+      separation_status: separation?.status ?? "idle",
+      separation_error: separation?.error,
+    }
+  }
   const res = await fetch(`${BASE}/library/external-song?${new URLSearchParams({ path })}`, {
     headers: apiHeaders(),
   })
@@ -292,13 +385,15 @@ export const getExternalSong = async (path: string): Promise<ExternalSong> => {
     const error = await res.json().catch(() => ({ detail: "Failed to open song file" }))
     throw new Error(error.detail ?? "Failed to open song file")
   }
-  return res.json()
+  const song: Omit<ExternalSong, "separation_available"> = await res.json()
+  return { ...song, separation_available: true }
 }
 
 export const saveExternalSong = async (
   path: string,
   phrases: JobResult["phrases"],
 ): Promise<string> => {
+  if (isTauri()) return invokeDesktop("save_external_chart", { path, phrases })
   const res = await fetch(`${BASE}/library/external-song?${new URLSearchParams({ path })}`, {
     method: "PUT",
     headers: apiHeaders(true),
@@ -324,9 +419,13 @@ export const startExternalSongSeparation = async (path: string): Promise<Externa
   return res.json()
 }
 
-export const getExternalSongSeparationStatus = async (path: string): Promise<ExternalSongSeparationStatus> => {
+export const getExternalSongSeparationStatus = async (
+  path: string,
+  signal?: AbortSignal,
+): Promise<ExternalSongSeparationStatus> => {
   const res = await fetch(`${BASE}/library/external-song/split-status?${new URLSearchParams({ path })}`, {
     headers: apiHeaders(),
+    signal,
   })
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: "Failed to get separation status" }))
@@ -350,7 +449,13 @@ export const getExternalSongDownloadUrl = (path: string): string => {
   return `${BASE}/library/external-song/download?${query}`
 }
 
+export const exportExternalSong = (path: string): Promise<void> =>
+  invokeDesktop("export_external_chart", { path })
+
 export const removeSong = async (song: SongListItem): Promise<void> => {
+  if (song.kind === "external" && isTauri()) {
+    return invokeDesktop("remove_external_chart", { path: song.path })
+  }
   const query = song.kind === "managed"
     ? new URLSearchParams({ job_id: song.id })
     : new URLSearchParams({ path: song.path ?? "" })

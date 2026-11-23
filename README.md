@@ -55,13 +55,20 @@ npm install
 npm run tauri:dev
 ```
 
-The desktop shell starts the Python API on `127.0.0.1:8000` when it is not already running. It also provides the Vite frontend through Tauri's native desktop window.
+In development, the desktop shell starts the Python API on `127.0.0.1:8000` when it is not already running. The Vite frontend uses it for managed jobs and stem separation.
 
-On first launch, choose a working directory for your song library. Managed jobs
-and existing `.txt` UltraStar charts under that directory appear together in
-the sidebar. External charts can be previewed as read-only source; removing
-one deletes only its chart file. The selected directory is persisted in
-`backend/outputs/working-directory.json`.
+On first launch, choose a working directory for your song library. You can
+open, play, edit, and save existing UltraStar charts in the desktop app without
+Python. When FFmpeg is on PATH, the app caches a PCM copy of MP3 tracks for
+precise seeking. In development, managed jobs appear alongside existing
+charts and the selected folder is shared with the Python API through
+`backend/outputs/working-directory.json`. Release builds store the selection
+in the app-data directory. Managed job processing and stem separation still
+need the development or browser API setup.
+
+Removing an existing chart at the library root deletes its chart file.
+Removing a nested chart deletes the containing song folder, as shown in the
+confirmation dialog.
 
 ### Backend (port 8000)
 

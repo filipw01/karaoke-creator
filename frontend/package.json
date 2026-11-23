@@ -26,9 +26,9 @@
     "vite": "^8.3.8"
   },
   "dependencies": {
-    "@tauri-apps/plugin-dialog": "^2.5.0",
     "@solidjs/router": "^2.0.1",
     "@solidjs/web": "^2.0.3",
+    "@tauri-apps/api": "^2.12.5",
     "solid-js": "^2.0.3"
   }
 }

@@ -149,6 +149,11 @@ def test_completed_song_is_published_into_selected_library(tmp_path: Path, monke
     })
     response = asyncio.run(main.list_library(request))
     assert [song["id"] for song in response["songs"]] == ["job"]
+    (library / "Other.txt").write_text("#TITLE:Other\n", encoding="utf-8")
+
+    response = asyncio.run(main.list_library(request, managed_only=True))
+    assert [song["id"] for song in response["songs"]] == ["job"]
+    assert response["published_paths"] == ["Artist - Song/Artist - Song.txt"]
 
 
 def test_managed_playback_uses_existing_pcm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

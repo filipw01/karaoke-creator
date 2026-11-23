@@ -1,13 +1,15 @@
 import { createSignal, For, Show } from "solid-js"
 import type { JSX } from "@solidjs/web"
 import { createRouter, defineRoutes, hashHistory, useLocation, useNavigate } from "@solidjs/router"
-import { open } from "@tauri-apps/plugin-dialog"
+import { isTauri } from "@tauri-apps/api/core"
 import type { AppStep, AudioTrack, JobResult } from "./types"
 import {
+  exportExternalSong,
   getExternalSong,
   getExternalSongAudioUrl,
   getExternalSongDownloadUrl,
   getExternalSongSeparationStatus,
+  pickWorkingDirectory,
   removeSong,
   saveExternalSong,
   startExternalSongSeparation,
@@ -49,6 +51,7 @@ const ALL_AUDIO_TRACKS: AudioTrack[] = [
   "instrumental_with_playback",
   "vocals_with_playback",
 ]
+const managedJobsAvailable = () => !isTauri() || import.meta.env.DEV
 
 const UploadFlow = () => {
   const navigate = useNavigate()
@@ -61,7 +64,11 @@ const UploadFlow = () => {
   }
 
   return (
-    <>
+    <Show when={managedJobsAvailable()} fallback={
+      <p class="mx-auto max-w-2xl text-sm text-zinc-400">
+        {songQueue.songs().length ? "Select a chart to open it." : "No UltraStar charts found in this folder."}
+      </p>
+    }>
       <Show when={error()}>
         <div class="max-w-2xl mx-auto mb-6 bg-red-500/10 border border-red-500/30 rounded-lg p-4 text-red-400">
           <p class="font-medium">Processing failed</p>
@@ -69,7 +76,7 @@ const UploadFlow = () => {
         </div>
       </Show>
       <Upload onUploaded={handleUploaded} />
-    </>
+    </Show>
   )
 }
 
@@ -88,6 +95,8 @@ interface ExternalChartEditor {
   path: string
   result: JobResult
   audioAvailable: boolean
+  playbackUrl?: string
+  separationAvailable: boolean
   stemsAvailable: boolean
   separationStatus: ExternalSongSeparationStatus["status"]
   separationError: string
@@ -139,8 +148,9 @@ const AppShell = (props: { children: JSX.Element }) => {
   const chooseDirectory = async () => {
     let directory: string | null = null
     try {
-      const selected = await open({ directory: true, multiple: false, title: "Choose your songs folder" })
-      if (typeof selected === "string") directory = selected
+      directory = isTauri()
+        ? await pickWorkingDirectory()
+        : window.prompt("Enter the full path to your songs folder")?.trim() || null
     } catch {
       directory = window.prompt("Enter the full path to your songs folder")?.trim() || null
     }
@@ -160,6 +170,8 @@ const AppShell = (props: { children: JSX.Element }) => {
           filename: externalSong.filename,
           path: externalSong.path,
           audioAvailable: externalSong.audio_available,
+          playbackUrl: externalSong.playback_url,
+          separationAvailable: externalSong.separation_available,
           stemsAvailable: externalSong.stems_available,
           separationStatus: externalSong.separation_status,
           separationError: externalSong.separation_error ?? "",
@@ -208,6 +220,7 @@ const AppShell = (props: { children: JSX.Element }) => {
       !current
       || current.path !== path
       || !current.audioAvailable
+      || !current.separationAvailable
       || current.stemsAvailable
       || current.separationStatus === "separating"
     ) return
@@ -249,6 +262,14 @@ const AppShell = (props: { children: JSX.Element }) => {
   const isSelectedSong = (song: SongListItem) => song.kind === "managed"
     ? activeJobId() === song.id
     : externalChart()?.path === song.path
+  const exportChart = async (path: string) => {
+    setLibraryError("")
+    try {
+      await exportExternalSong(path)
+    } catch (error) {
+      setLibraryError(error instanceof Error ? error.message : "Failed to save a copy of the chart")
+    }
+  }
   const confirmRemoval = async () => {
     const song = pendingRemoval()
     if (!song || removingSong()) return
@@ -257,6 +278,7 @@ const AppShell = (props: { children: JSX.Element }) => {
     try {
       await removeSong(song)
       setPendingRemoval(null)
+      if (song.kind === "external" && externalChart()?.path === song.path) setExternalChart(null)
       await refreshSongs()
       if (song.kind === "managed" && activeJobId() === song.id) navigate("/")
     } catch (error) {
@@ -340,18 +362,20 @@ const AppShell = (props: { children: JSX.Element }) => {
           </Show>
           <div class="mb-3 flex items-center justify-between px-2">
             <h2 class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Songs</h2>
-            <button
-              type="button"
-              onClick={() => {
-                externalSongRequest += 1
-                setExternalSongLoading(false)
-                setExternalChart(null)
-                navigate("/")
-              }}
-              class="text-xs text-violet-400 hover:text-violet-300"
-            >
-              + Add
-            </button>
+            <Show when={managedJobsAvailable()}>
+              <button
+                type="button"
+                onClick={() => {
+                  externalSongRequest += 1
+                  setExternalSongLoading(false)
+                  setExternalChart(null)
+                  navigate("/")
+                }}
+                class="text-xs text-violet-400 hover:text-violet-300"
+              >
+                + Add
+              </button>
+            </Show>
           </div>
           <Show when={!songQueue.loading()} fallback={<div class="px-2 text-sm text-zinc-500">Loading songs...</div>}>
             <div class="space-y-1">
@@ -451,28 +475,40 @@ const AppShell = (props: { children: JSX.Element }) => {
                         <span class="text-xs text-zinc-500">Source audio not found</span>
                       }>
                         <Show when={chart().stemsAvailable} fallback={
-                          <button
-                            type="button"
-                            onClick={() => void separateExistingSong(chart().path)}
-                            disabled={chart().separationStatus === "separating"}
-                            class="rounded-lg bg-violet-600 px-3 py-2 text-xs font-medium text-white hover:bg-violet-500 disabled:cursor-wait disabled:opacity-60"
-                          >
-                            {chart().separationStatus === "separating"
-                              ? "Separating vocals…"
-                              : chart().separationStatus === "error"
-                                ? "Retry vocal separation"
-                                : "Split vocals & instrumental"}
-                          </button>
+                          <Show when={chart().separationAvailable}>
+                            <button
+                              type="button"
+                              onClick={() => void separateExistingSong(chart().path)}
+                              disabled={chart().separationStatus === "separating"}
+                              class="rounded-lg bg-violet-600 px-3 py-2 text-xs font-medium text-white hover:bg-violet-500 disabled:cursor-wait disabled:opacity-60"
+                            >
+                              {chart().separationStatus === "separating"
+                                ? "Separating vocals…"
+                                : chart().separationStatus === "error"
+                                  ? "Retry vocal separation"
+                                  : "Split vocals & instrumental"}
+                            </button>
+                          </Show>
                         }>
                           <span class="text-xs text-emerald-400">Vocal and instrumental stems ready</span>
                         </Show>
                       </Show>
-                      <a
-                        href={getExternalSongDownloadUrl(chart().path)}
-                        class="rounded border border-zinc-700 px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-800"
-                      >
-                        Download chart
-                      </a>
+                      <Show when={isTauri()} fallback={
+                        <a
+                          href={getExternalSongDownloadUrl(chart().path)}
+                          class="rounded border border-zinc-700 px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-800"
+                        >
+                          Download chart
+                        </a>
+                      }>
+                        <button
+                          type="button"
+                          onClick={() => void exportChart(chart().path)}
+                          class="rounded border border-zinc-700 px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-800"
+                        >
+                          Save chart copy
+                        </button>
+                      </Show>
                     </div>
                   </div>
                   <Show when={chart().separationStatus === "separating"}>
@@ -489,7 +525,7 @@ const AppShell = (props: { children: JSX.Element }) => {
                     saveNotes={(phrases) => saveExternalSong(chart().path, phrases)}
                     audioSourceUrl={chart().audioAvailable ? undefined : null}
                     audioSourceUrls={chart().audioAvailable ? {
-                      original: getExternalSongAudioUrl(chart().path, "original"),
+                      original: chart().playbackUrl ?? getExternalSongAudioUrl(chart().path, "original"),
                       ...(chart().stemsAvailable ? {
                         vocals: getExternalSongAudioUrl(chart().path, "vocals"),
                         instrumental: getExternalSongAudioUrl(chart().path, "instrumental"),

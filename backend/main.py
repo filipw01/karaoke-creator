@@ -70,6 +70,10 @@ YTDLP_CACHE_DIR = os.path.join(OUTPUT_DIR, "yt-dlp-cache")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# Worktrees can share a read-only environment. Keep librosa's Numba cache
+# beside the backend outputs unless the caller has configured another location.
+os.environ.setdefault("NUMBA_CACHE_DIR", os.path.join(OUTPUT_DIR, "numba-cache"))
+
 # The JSON store keeps local deployments recoverable without introducing a
 # database dependency. Deployments with multiple API processes should point
 # this at shared durable storage or replace it with their database adapter.
@@ -3220,7 +3224,7 @@ async def set_working_directory(body: dict[str, Any]) -> dict[str, str | None]:
 
 
 @app.get("/api/library")
-async def list_library(request: Request) -> dict[str, Any]:
+async def list_library(request: Request, managed_only: bool = False) -> dict[str, Any]:
     owner_id = _request_owner(request)
     items: list[dict[str, Any]] = []
     queued_jobs = sorted(
@@ -3252,7 +3256,7 @@ async def list_library(request: Request) -> dict[str, Any]:
         })
 
     directory = _working_directory()
-    if directory and os.path.isdir(directory):
+    if not managed_only and directory and os.path.isdir(directory):
         root = Path(directory).resolve()
         for current, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames[:] = [
@@ -3291,6 +3295,17 @@ async def list_library(request: Request) -> dict[str, Any]:
                     "progress_percent": 0,
                 })
     items.sort(key=lambda item: (item["kind"] != "managed", item["title"].casefold(), item["artist"].casefold()))
+    if managed_only:
+        root = Path(directory).resolve() if directory else None
+        return {
+            "working_directory": directory,
+            "songs": items,
+            "published_paths": sorted(
+                chart.relative_to(root).as_posix()
+                for chart in published_charts
+                if root is not None and chart.is_relative_to(root)
+            ),
+        }
     return {"working_directory": directory, "songs": items}
 
 
