@@ -1,5 +1,4 @@
-import { createMemo, createSignal, onCleanup, Show } from "solid-js"
-import { createEffect } from "../solidCompat"
+import { createEffect, createMemo, createSignal, onCleanup, Show, untrack } from "solid-js"
 import { Portal } from "@solidjs/web"
 import {
   getResult,
@@ -43,8 +42,9 @@ type AlignmentBackend = "sofa" | "legacy"
 export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
   const jobId = () => props.jobId
   const result = () => props.result
-  const onResultChange = props.onResultChange
-  const onDirtyChange = props.onDirtyChange
+  let disposed = false
+  onCleanup(() => { disposed = true })
+  const isCurrentJob = (id: string) => !disposed && jobId() === id
   const revision = createMemo(() => result().lyric_revision ?? null)
   const draftRevision = createMemo(() => result().lyric_revisions?.find((item) => item.id === result().selected_lyric_revision_id) ?? revision())
   const tokens = createMemo(() => draftRevision()?.tokens ?? [])
@@ -62,22 +62,25 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
       end_locked: false,
     }))
   })
-  const [lyricsDraft, setLyricsDraft] = createSignal(draftRevision()?.raw_text ?? "")
-  const [savedLyricsDraft, setSavedLyricsDraft] = createSignal(draftRevision()?.raw_text ?? "")
-  const [draftRevisionId, setDraftRevisionId] = createSignal(draftRevision()?.id ?? "")
+  const initialRevision = untrack(draftRevision)
+  const [lyricsDraft, setLyricsDraft] = createSignal(initialRevision?.raw_text ?? "")
+  const [savedLyricsDraft, setSavedLyricsDraft] = createSignal(initialRevision?.raw_text ?? "")
+  const [draftRevisionId, setDraftRevisionId] = createSignal(initialRevision?.id ?? "")
   const [busyToken, setBusyToken] = createSignal<string | null>(null)
   const [savingLyrics, setSavingLyrics] = createSignal(false)
   const [realigning, setRealigning] = createSignal(false)
-  const [alignmentBackend, setAlignmentBackend] = createSignal<AlignmentBackend>(
-    result().alignment_run?.selected_strategy?.startsWith("legacy") ? "legacy" : "sofa",
-  )
+  const [alignmentBackend, setAlignmentBackend] = createSignal<AlignmentBackend>("sofa")
   const [error, setError] = createSignal<string | null>(null)
 
-  createEffect(() => {
-    setLyricsDraft(draftRevision()?.raw_text ?? "")
-    setSavedLyricsDraft(draftRevision()?.raw_text ?? "")
-    setDraftRevisionId(draftRevision()?.id ?? "")
-  }, () => undefined)
+  createEffect(
+    () => [jobId(), draftRevision()?.id ?? "", draftRevision()?.raw_text ?? ""] as const,
+    ([job, revision, text], previous) => {
+      if (previous?.[0] === job && previous[1] === revision && previous[2] === text) return
+      setLyricsDraft(text)
+      setSavedLyricsDraft(text)
+      setDraftRevisionId(revision)
+    },
+  )
 
   const alignmentByToken = createMemo(() => new Map(alignments().map((alignment) => [alignment.token_id, alignment])))
   const flaggedTokens = createMemo(() => tokens().filter((token) => alignmentByToken().get(token.id)?.status !== "aligned"))
@@ -85,40 +88,43 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
   const lyricsDirty = createMemo(() => lyricsDraft() !== savedLyricsDraft())
   const alignmentIsCurrent = createMemo(() => draftRevision()?.id === revision()?.id)
 
-  createEffect(() => {
-    onDirtyChange?.(lyricsDirty())
-  }, () => undefined)
+  createEffect(lyricsDirty, (dirty) => {
+    props.onDirtyChange?.(dirty)
+  })
 
-  createEffect(() => {
-    const strategy = result().alignment_run?.selected_strategy ?? ""
-    if (strategy.startsWith("legacy")) setAlignmentBackend("legacy")
-    else if (strategy.startsWith("sofa")) setAlignmentBackend("sofa")
-  }, () => undefined)
+  createEffect(
+    () => result().alignment_run?.selected_strategy,
+    (strategy) => {
+      if (strategy?.startsWith("legacy")) setAlignmentBackend("legacy")
+      else if (strategy?.startsWith("sofa")) setAlignmentBackend("sofa")
+    },
+  )
 
-  const refreshResult = async () => {
-    const next = await getResult(jobId())
-    onResultChange(next)
-    return next
+  const refreshResult = async (id: string) => {
+    if (!isCurrentJob(id)) return
+    const next = await getResult(id)
+    if (isCurrentJob(id)) props.onResultChange(next)
   }
 
   const resetAllLocks = async () => {
     if (lockedAlignments().length === 0) return
+    const id = jobId()
     setBusyToken("all")
     setError(null)
     try {
       await Promise.all(lockedAlignments().map((alignment) => resetWordAlignment(
-        jobId(),
+        id,
         alignment.token_id,
         [
           ...(alignment.start_locked ? ["start" as const] : []),
           ...(alignment.end_locked ? ["end" as const] : []),
         ],
       )))
-      await refreshResult()
+      await refreshResult(id)
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to reset manual locks")
+      if (isCurrentJob(id)) setError(err instanceof Error ? err.message : "Failed to reset manual locks")
     } finally {
-      setBusyToken(null)
+      if (isCurrentJob(id)) setBusyToken(null)
     }
   }
 
@@ -127,20 +133,21 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
       setError("Lyrics cannot be empty.")
       return
     }
+    const id = jobId()
     setSavingLyrics(true)
     setError(null)
     try {
       const language: LyricLanguage = revision()?.language === "pl" ? "pl" : "en"
-      const saved = await saveLyricRevision(jobId(), lyricsDraft(), language)
+      const saved = await saveLyricRevision(id, lyricsDraft(), language)
+      if (!isCurrentJob(id)) return
       setDraftRevisionId(saved.id)
       setLyricsDraft(saved.raw_text)
       setSavedLyricsDraft(saved.raw_text)
-      const next = await getResult(jobId())
-      onResultChange(next)
+      await refreshResult(id)
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save lyric revision")
+      if (isCurrentJob(id)) setError(err instanceof Error ? err.message : "Failed to save lyric revision")
     } finally {
-      setSavingLyrics(false)
+      if (isCurrentJob(id)) setSavingLyrics(false)
     }
   }
 
@@ -150,23 +157,27 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
       setError("Save the lyric revision before re-aligning it.")
       return
     }
+    const id = jobId()
     setRealigning(true)
     setError(null)
     try {
-      const started = await startAlignmentRun(jobId(), draftRevisionId(), [], alignmentBackend())
+      const started = await startAlignmentRun(id, draftRevisionId(), [], alignmentBackend())
       let transientFailures = 0
       for (let attempt = 0; attempt < 900; attempt += 1) {
         await sleep(1000)
+        if (!isCurrentJob(id)) return
         try {
-          const status = await getStatus(jobId())
+          const status = await getStatus(id)
+          if (!isCurrentJob(id)) return
           transientFailures = 0
           const matchingRun = status.alignment_run?.id === started.alignment_run_id
           if (matchingRun && status.status === "done") {
-            const next = await getResult(jobId())
+            const next = await getResult(id)
+            if (!isCurrentJob(id)) return
             if (next.alignment_run?.id !== started.alignment_run_id) {
               throw new Error("Alignment completed but the returned result belongs to another run")
             }
-            onResultChange(next)
+            props.onResultChange(next)
             break
           }
           if (matchingRun && status.status === "error") {
@@ -180,20 +191,20 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
         if (attempt === 899) throw new Error("Alignment timed out")
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to re-align lyrics")
+      if (isCurrentJob(id)) setError(err instanceof Error ? err.message : "Failed to re-align lyrics")
     } finally {
-      setRealigning(false)
+      if (isCurrentJob(id)) setRealigning(false)
     }
   }
 
-  createEffect(() => {
-    if (!props.open) return
+  createEffect(() => props.open, (open) => {
+    if (!open) return
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") props.onClose()
     }
     document.addEventListener("keydown", closeOnEscape)
-    onCleanup(() => document.removeEventListener("keydown", closeOnEscape))
-  }, () => undefined)
+    return () => document.removeEventListener("keydown", closeOnEscape)
+  })
 
   return (
     <Show when={props.open}>

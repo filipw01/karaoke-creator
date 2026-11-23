@@ -1,8 +1,7 @@
-import { createSignal, onCleanup, Show } from "solid-js"
-import { createEffect } from "../solidCompat"
+import { createEffect, createSignal, Show } from "solid-js"
 import { useParams, useNavigate } from "@solidjs/router"
 import type { JobResult } from "../types"
-import { getResult, startAlignmentComparison } from "../api"
+import { getResult, getStatus, startAlignmentComparison } from "../api"
 import { Editor } from "../components/Editor"
 
 export const EditorPage = () => {
@@ -10,17 +9,19 @@ export const EditorPage = () => {
   const navigate = useNavigate()
   const [result, setResult] = createSignal<JobResult | null>(null)
   const [loading, setLoading] = createSignal(true)
+  const [loadedJobId, setLoadedJobId] = createSignal<string | null>(null)
   const [error, setError] = createSignal<string | null>(null)
   let comparisonStarted: string | null = null
 
-  createEffect(() => {
-    const id = params.jobId
+  createEffect(() => params.jobId, (id) => {
     if (!id) {
       setError("No job ID provided")
       setLoading(false)
       return
     }
 
+    setLoading(true)
+    setError(null)
     let cancelled = false
     let pollTimer: number | null = null
 
@@ -29,13 +30,41 @@ export const EditorPage = () => {
         const data = await getResult(id)
         if (cancelled) return
         setResult(data)
+        setLoadedJobId(id)
         const strategy = data.alignment_run?.selected_strategy ?? ""
         const isEnglishSofa = data.lyric_revision?.language === "en" && strategy.includes("sofa")
         const comparison = data.alignment_comparison
-        if (
+        const pollComparison = () => {
+          pollTimer = window.setTimeout(async () => {
+            try {
+              const { alignment_comparison_status: status } = await getStatus(id)
+              if (cancelled) return
+              if (status === "running") {
+                pollComparison()
+                return
+              }
+              const latest = await getResult(id)
+              if (cancelled) return
+              if (!latest.alignment_comparison?.status || latest.alignment_comparison.status === "running") {
+                pollComparison()
+                return
+              }
+              setResult((current) => current ? {
+                ...current,
+                alignment_comparison: latest.alignment_comparison,
+                alignment_results: { ...current.alignment_results, ...latest.alignment_results },
+              } : current)
+            } catch {
+              if (!cancelled) pollComparison()
+            }
+          }, 2000)
+        }
+
+        if (comparison?.status === "running") {
+          pollComparison()
+        } else if (
           isEnglishSofa &&
           comparison?.status !== "completed" &&
-          comparison?.status !== "running" &&
           comparison?.status !== "not_supported" &&
           !data.alignment_results?.legacy &&
           comparisonStarted !== id
@@ -43,25 +72,9 @@ export const EditorPage = () => {
           comparisonStarted = id
           try {
             const started = await startAlignmentComparison(id, data.selected_lyric_revision_id)
-            if (cancelled) return
-            if (started.status === "running") {
-              pollTimer = window.setInterval(async () => {
-                try {
-                  const latest = await getResult(id)
-                  if (cancelled) return
-                  setResult(latest)
-                  const status = latest.alignment_comparison?.status
-                  if (status && status !== "running") {
-                    if (pollTimer !== null) window.clearInterval(pollTimer)
-                    pollTimer = null
-                  }
-                } catch {
-                  // Keep the SOFA result usable if the optional comparison poll fails.
-                }
-              }, 2000)
-            }
+            if (!cancelled && started.status === "running") pollComparison()
           } catch {
-            // Comparison is optional; the immediately available SOFA result remains usable.
+            // The comparison is optional and the editor can use the initial result.
           }
         }
       } catch (err) {
@@ -73,14 +86,14 @@ export const EditorPage = () => {
     }
 
     loadResult()
-    onCleanup(() => {
+    return () => {
       cancelled = true
-      if (pollTimer !== null) window.clearInterval(pollTimer)
-    })
-  }, () => undefined)
+      if (pollTimer !== null) window.clearTimeout(pollTimer)
+    }
+  })
 
   return (
-    <Show when={!loading()} fallback={
+    <Show when={!loading() && (loadedJobId() === params.jobId || error())} fallback={
       <div class="max-w-7xl mx-auto px-4 py-10">
         <div class="text-center text-zinc-400">Loading editor...</div>
       </div>
@@ -102,7 +115,9 @@ export const EditorPage = () => {
     <Editor
       jobId={params.jobId}
       result={result()!}
-      onResultChange={setResult}
+      onResultChange={(next) => {
+        if (loadedJobId() === params.jobId) setResult(next)
+      }}
       onExport={() => navigate(`/export/${params.jobId}`)}
     />
     </Show>

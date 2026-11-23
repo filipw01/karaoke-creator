@@ -374,6 +374,7 @@ export const getStatus = async (
   found_lyrics?: string
   progress_percent?: number
   lyric_revision_id?: string
+  alignment_comparison_status?: string | null
   alignment_run?: AlignmentRun
 }> => {
   const res = await fetch(`${BASE}/jobs/${jobId}/status`, { headers: apiHeaders() })

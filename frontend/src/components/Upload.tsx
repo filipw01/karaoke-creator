@@ -1,5 +1,4 @@
-import { createSignal, onCleanup } from "solid-js"
-import { createEffect } from "../solidCompat"
+import { createEffect, createSignal } from "solid-js"
 import { uploadFile, parseFilename, searchYouTube, downloadYouTube, getStatus, type YouTubeSearchResult } from "../api"
 
 interface UploadProps {
@@ -100,9 +99,8 @@ export const Upload = ({ onUploaded }: UploadProps) => {
   }
 
   // Poll download progress
-  createEffect(() => {
-    const jobId = downloadJobId()
-    if (!jobId || !downloading()) return
+  createEffect(() => downloading() ? downloadJobId() : null, (jobId) => {
+    if (!jobId) return
 
     let cancelled = false
     let timerId: number
@@ -144,11 +142,11 @@ export const Upload = ({ onUploaded }: UploadProps) => {
     }
 
     timerId = window.setTimeout(pollProgress, 500)
-    onCleanup(() => {
+    return () => {
       cancelled = true
       if (timerId) window.clearTimeout(timerId)
-    })
-  }, () => undefined)
+    }
+  })
 
   const handleSubmit = async (e: SubmitEvent) => {
     e.preventDefault()

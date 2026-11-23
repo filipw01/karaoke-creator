@@ -1,48 +1,53 @@
-import { createSignal, Show } from "solid-js"
-import { createEffect } from "../solidCompat"
+import { createEffect, createSignal, Show } from "solid-js"
 import { useParams, useNavigate } from "@solidjs/router"
 import type { JobResult } from "../types"
 import { getResult } from "../api"
 import { Export } from "../components/Export"
 
 export const ExportPage = () => {
-  const { jobId } = useParams<{ jobId: string }>()
+  const params = useParams<{ jobId: string }>()
   const navigate = useNavigate()
-  const [result, setResult] = createSignal<JobResult | null>(null)
+  const [loaded, setLoaded] = createSignal<{ jobId: string; result: JobResult } | null>(null)
   const [loading, setLoading] = createSignal(true)
   const [error, setError] = createSignal<string | null>(null)
 
-  createEffect(() => {
+  createEffect(() => params.jobId, (jobId) => {
     if (!jobId) {
       setError("No job ID provided")
       setLoading(false)
       return
     }
 
+    setLoading(true)
+    setError(null)
+    let cancelled = false
+
     const loadResult = async () => {
       try {
         const data = await getResult(jobId)
+        if (cancelled) return
         if (data.export_ready === false) {
           throw new Error("The selected lyric revision has not been aligned yet. Return to the editor and re-align it first.")
         }
-        setResult(data)
+        setLoaded({ jobId, result: data })
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load job")
+        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load job")
       } finally {
-        setLoading(false)
+        if (!cancelled) setLoading(false)
       }
     }
 
-    loadResult()
-  }, () => undefined)
+    void loadResult()
+    return () => { cancelled = true }
+  })
 
   return (
-    <Show when={!loading()} fallback={
+    <Show when={!loading() && (loaded()?.jobId === params.jobId || error())} fallback={
       <div class="max-w-7xl mx-auto px-4 py-10">
         <div class="text-center text-zinc-400">Loading export page...</div>
       </div>
     }>
-    <Show when={!error() && result()} fallback={
+    <Show when={!error() && loaded()} fallback={
       <div class="max-w-7xl mx-auto px-4 py-10">
         <div class="max-w-2xl mx-auto bg-red-500/10 border border-red-500/30 rounded-lg p-4 text-red-400">
           <p class="font-medium">Failed to load export page</p>
@@ -57,9 +62,9 @@ export const ExportPage = () => {
       </div>
     }>
     <Export
-      jobId={jobId}
-      result={result()!}
-      onBack={() => navigate(`/editor/${jobId}`)}
+      jobId={loaded()!.jobId}
+      result={loaded()!.result}
+      onBack={() => navigate(`/editor/${loaded()!.jobId}`)}
       onStartOver={() => navigate("/")}
     />
     </Show>

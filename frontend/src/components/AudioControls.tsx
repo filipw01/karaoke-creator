@@ -1,5 +1,4 @@
-import { For, onCleanup } from "solid-js"
-import { createEffect } from "../solidCompat"
+import { For, createEffect } from "solid-js"
 import type { AudioTrack } from "../types"
 import { getAudioUrl } from "../api"
 
@@ -11,6 +10,10 @@ interface AudioControlsProps {
   isPlaying: boolean
   onTogglePlayback: () => void
   onAudioTrackChange: (track: AudioTrack) => void
+  onSourceChange: (audio: HTMLAudioElement, source: string, previousSource: string | undefined) => void
+  onPlaying: () => void
+  onWaiting: () => void
+  onPause: () => void
   onEnded: () => void
   onTimeUpdate: () => void
   onSeeked: () => void
@@ -21,8 +24,6 @@ interface AudioControlsProps {
   audioSourceUrls?: Partial<Record<AudioTrack, string>>
   availableTracks?: AudioTrack[]
   showTrackSelection?: boolean
-  preserveTime?: number | null
-  resumeAfterLoad?: boolean
 }
 
 const AUDIO_TRACK_OPTIONS: Array<[AudioTrack, string]> = [
@@ -46,31 +47,10 @@ export const AudioControls = (props: AudioControlsProps) => {
     return props.audioSourceUrl ?? getAudioUrl(props.jobId, props.audioTrack)
   }
 
-  createEffect(() => {
-    const source = sourceUrl()
+  createEffect(sourceUrl, (source, previousSource) => {
     const audio = props.audioRef.current
-    if (!audio) return
-    if (source && audio.src === new URL(source, document.baseURI).href && audio.readyState >= 1) return
-    // The same element is reused for all stems (important for Web Audio's
-    // MediaElementSource), so explicitly restart its resource when the track
-    // changes instead of relying on the browser's src mutation timing.
-    const savedTime = props.preserveTime ?? audio.currentTime
-    const shouldResume = props.resumeAfterLoad ?? false
-    let restored = false
-    const restorePosition = (): void => {
-      if (restored) return
-      restored = true
-      const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : Number.POSITIVE_INFINITY
-      audio.currentTime = Math.min(Math.max(0, savedTime), duration)
-      if (shouldResume) void audio.play().catch(() => {})
-    }
-    audio.pause()
-    audio.src = source
-    audio.addEventListener("loadedmetadata", restorePosition)
-    audio.load()
-    if (audio.readyState >= 1) restorePosition()
-    onCleanup(() => audio.removeEventListener("loadedmetadata", restorePosition))
-  }, () => undefined)
+    if (audio && source !== previousSource) props.onSourceChange(audio, source, previousSource)
+  })
 
   return (
     <section
@@ -129,8 +109,10 @@ export const AudioControls = (props: AudioControlsProps) => {
 
       <audio
         ref={(audio) => { props.audioRef.current = audio }}
-        src={sourceUrl()}
         preload="auto"
+        onPlaying={props.onPlaying}
+        onWaiting={props.onWaiting}
+        onPause={props.onPause}
         onEnded={props.onEnded}
         onTimeUpdate={props.onTimeUpdate}
         onSeeked={props.onSeeked}

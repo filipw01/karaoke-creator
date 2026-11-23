@@ -1,22 +1,5 @@
 import { createMemo } from "solid-js"
 
-const TimelineScrubberPlayhead = (props: {
-  currentBeat: number
-  displayTime: number
-  totalBeats: number
-  pixelsPerBeat: number
-}) => {
-  if (props.displayTime < 0 || props.currentBeat < 0 || props.currentBeat > props.totalBeats) return null
-  return (
-    <div
-      class="absolute top-0 bottom-0 w-0.5 bg-pink-500 pointer-events-none z-10 transition-none"
-      style={{ left: `${props.currentBeat * props.pixelsPerBeat}px` }}
-    >
-      <div class="absolute -top-1 left-1/2 -translate-x-1/2 w-3 h-3 bg-pink-500 rounded-full border-2 border-zinc-900" />
-    </div>
-  )
-}
-
 const TimelineScrubberGrid = (props: {
   totalBeats: number
   beatToTime: (beat: number) => number
@@ -37,8 +20,6 @@ const TimelineScrubberGrid = (props: {
       return [{ beat, label }]
     })
   })
-  const measureWidth = props.pixelsPerBeat * 16
-  const beatGroupWidth = props.pixelsPerBeat * 4
   return (
     <div
       class="pointer-events-none absolute inset-0"
@@ -49,7 +30,7 @@ const TimelineScrubberGrid = (props: {
           "linear-gradient(to right, #52525b 0, #52525b 1px, transparent 1px)",
           "linear-gradient(to right, #3f3f46 0, #3f3f46 1px, transparent 1px)",
         ].join(", "),
-        "background-size": `${measureWidth}px 100%, ${beatGroupWidth}px 100%, ${props.pixelsPerBeat}px 100%`,
+        "background-size": `${props.pixelsPerBeat * 16}px 100%, ${props.pixelsPerBeat * 4}px 100%, ${props.pixelsPerBeat}px 100%`,
         "background-repeat": "repeat",
       }}
     >
@@ -79,6 +60,7 @@ interface TimelineScrubberTrackProps {
 }
 
 const TimelineScrubberTrack = (props: TimelineScrubberTrackProps) => {
+  const accessibleTime = createMemo(() => Math.round(props.displayTime * 10) / 10)
   return (
     <div
       ref={(node) => {
@@ -94,7 +76,7 @@ const TimelineScrubberTrack = (props: TimelineScrubberTrackProps) => {
       aria-label="Seek position"
       aria-valuemin={0}
       aria-valuemax={props.totalDuration}
-      aria-valuenow={props.displayTime}
+      aria-valuenow={accessibleTime()}
       tabindex={0}
       onKeyDown={props.onSeekKeyDown}
     >
@@ -106,7 +88,8 @@ const TimelineScrubberTrack = (props: TimelineScrubberTrackProps) => {
 interface TimelineScrubberProps {
   totalBeats: number
   totalDuration: number
-  currentBeat: number
+  playheadX: number
+  playheadVisible: boolean
   displayTime: number
   beatToTime: (beat: number) => number
   pixelsPerBeat: number
@@ -133,12 +116,16 @@ export const TimelineScrubber = (props: TimelineScrubberProps) => {
         onSeekKeyDown={props.onSeekKeyDown}
       >
         <TimelineScrubberGrid totalBeats={props.totalBeats} beatToTime={props.beatToTime} pixelsPerBeat={props.pixelsPerBeat} />
-        <TimelineScrubberPlayhead
-          currentBeat={props.currentBeat}
-          displayTime={props.displayTime}
-          totalBeats={props.totalBeats}
-          pixelsPerBeat={props.pixelsPerBeat}
-        />
+        <div
+          class="pointer-events-none absolute bottom-0 left-0 top-0 z-10 w-0.5 bg-pink-500"
+          style={{
+            transform: `translateX(${props.playheadX}px)`,
+            visibility: props.playheadVisible ? "visible" : "hidden",
+          }}
+          aria-hidden="true"
+        >
+          <div class="absolute -top-1 left-1/2 h-3 w-3 -translate-x-1/2 rounded-full border-2 border-zinc-900 bg-pink-500" />
+        </div>
       </TimelineScrubberTrack>
     </section>
   )

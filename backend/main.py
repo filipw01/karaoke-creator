@@ -3219,41 +3219,11 @@ async def set_working_directory(body: dict[str, Any]) -> dict[str, str | None]:
     return {"directory": directory}
 
 
-@app.get("/api/library")
-async def list_library(request: Request) -> dict[str, Any]:
-    owner_id = _request_owner(request)
+def _list_external_charts(directory: str | None, published_charts: set[Path]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    queued_jobs = sorted(
-        (
-            job for job in jobs.values()
-            if job.owner_id == owner_id and job.queued_at
-        ),
-        key=lambda job: job.queued_at,
-    )
-    queue_positions = {job.id: index for index, job in enumerate(queued_jobs, start=1)}
-    published_charts: set[Path] = set()
-    for job in jobs.values():
-        if job.owner_id != owner_id:
-            continue
-        if job.library_path:
-            published_charts.add((Path(job.library_path) / f"{_sanitize_filename(f'{job.metadata.artist} - {job.metadata.title}') or 'song'}.txt").resolve())
-        items.append({
-            "id": job.id,
-            "kind": "managed",
-            "title": job.metadata.title or os.path.splitext(job.original_filename)[0] or "Untitled song",
-            "artist": job.metadata.artist,
-            "filename": job.original_filename,
-            "status": job.status.value,
-            "message": job.progress_message,
-            "progress_percent": job.progress_percent,
-            "error": job.error,
-            "failed_phase": job.failed_phase,
-            "queue_position": queue_positions.get(job.id),
-        })
-
-    directory = _working_directory()
     if directory and os.path.isdir(directory):
         root = Path(directory).resolve()
+        published_charts = {chart.resolve() for chart in published_charts}
         for current, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames[:] = [
                 name for name in dirnames
@@ -3290,6 +3260,43 @@ async def list_library(request: Request) -> dict[str, Any]:
                     "message": "Existing UltraStar song",
                     "progress_percent": 0,
                 })
+    return items
+
+
+@app.get("/api/library")
+async def list_library(request: Request) -> dict[str, Any]:
+    owner_id = _request_owner(request)
+    items: list[dict[str, Any]] = []
+    queued_jobs = sorted(
+        (
+            job for job in jobs.values()
+            if job.owner_id == owner_id and job.queued_at
+        ),
+        key=lambda job: job.queued_at,
+    )
+    queue_positions = {job.id: index for index, job in enumerate(queued_jobs, start=1)}
+    published_charts: set[Path] = set()
+    for job in jobs.values():
+        if job.owner_id != owner_id:
+            continue
+        if job.library_path:
+            published_charts.add(Path(job.library_path) / f"{_sanitize_filename(f'{job.metadata.artist} - {job.metadata.title}') or 'song'}.txt")
+        items.append({
+            "id": job.id,
+            "kind": "managed",
+            "title": job.metadata.title or os.path.splitext(job.original_filename)[0] or "Untitled song",
+            "artist": job.metadata.artist,
+            "filename": job.original_filename,
+            "status": job.status.value,
+            "message": job.progress_message,
+            "progress_percent": job.progress_percent,
+            "error": job.error,
+            "failed_phase": job.failed_phase,
+            "queue_position": queue_positions.get(job.id),
+        })
+
+    directory = _working_directory()
+    items.extend(await asyncio.to_thread(_list_external_charts, directory, published_charts))
     items.sort(key=lambda item: (item["kind"] != "managed", item["title"].casefold(), item["artist"].casefold()))
     return {"working_directory": directory, "songs": items}
 
@@ -3548,6 +3555,8 @@ async def get_status(job_id: str) -> dict[str, Any]:
         result["alignment_run"] = _serialize_alignment_run(job.alignment_runs[-1])
     if job.selected_lyric_revision_id:
         result["lyric_revision_id"] = job.selected_lyric_revision_id
+    if job.result and job.result.alignment_comparison:
+        result["alignment_comparison_status"] = job.result.alignment_comparison.get("status")
     return result
 
 

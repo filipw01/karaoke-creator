@@ -1,12 +1,11 @@
-import { createSignal, onCleanup } from "solid-js"
+import { createSignal, createStore, onCleanup, reconcile } from "solid-js"
 import { listSongs, setWorkingDirectory, startProcessing, type SongListItem } from "./api"
 
-const [songs, setSongs] = createSignal<Array<SongListItem>>([])
+const [songs, setSongs] = createStore<SongListItem[]>([])
 const [workingDirectory, setWorkingDirectoryState] = createSignal<string | null>(null)
 const [loading, setLoading] = createSignal(true)
 const [error, setError] = createSignal("")
 const autoStartIds = new Set<string>()
-let refreshTimer: number | undefined
 let refreshing = false
 
 export const refreshSongs = async () => {
@@ -15,7 +14,7 @@ export const refreshSongs = async () => {
   try {
     const library = await listSongs()
     setWorkingDirectoryState(library.working_directory)
-    setSongs(library.songs)
+    setSongs(reconcile(library.songs, "id"))
     setError("")
 
     for (const song of library.songs) {
@@ -39,7 +38,7 @@ export const refreshSongs = async () => {
 export const enqueueSong = async (jobId: string) => {
   autoStartIds.add(jobId)
   await refreshSongs()
-  if (songs().some((song) => song.id === jobId && song.status === "pending")) {
+  if (songs.some((song) => song.id === jobId && song.status === "pending")) {
     try {
       await startProcessing(jobId)
       await refreshSongs()
@@ -64,10 +63,8 @@ export const setLibraryDirectory = async (directory: string) => {
 
 export const startSongQueue = () => {
   void refreshSongs()
-  refreshTimer = window.setInterval(() => void refreshSongs(), 2000)
-  onCleanup(() => {
-    if (refreshTimer !== undefined) window.clearInterval(refreshTimer)
-  })
+  const refreshTimer = window.setInterval(() => void refreshSongs(), 2000)
+  onCleanup(() => window.clearInterval(refreshTimer))
 }
 
 export const songQueue = {
