@@ -1,9 +1,7 @@
-import { createEffect as createPostRenderEffect, createMemo, createSignal, onCleanup } from "solid-js"
-import { createEffect } from "../solidCompat"
-import type { JobResult, UltraStarNote } from "../types"
-import { useInstrumentalPiano } from "../useInstrumentalPiano"
+import { createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
+import type { JobResult, Phrase, UltraStarNote } from "../types"
 import { switchAlignmentMode, updateNotes } from "../api"
-import { playPianoNote, playTestPiano, type PianoResumeRef } from "../useInstrumentalPiano"
+import { isPianoTrack, playPianoNote, playTestPiano, useInstrumentalPiano, type PianoResumeRef } from "../useInstrumentalPiano"
 import type { AudioTrack } from "./AudioControls"
 import { AudioControls } from "./AudioControls"
 import { EditorHeader } from "./EditorHeader"
@@ -32,7 +30,12 @@ interface EditorProps {
 const MIN_PIXELS_PER_BEAT = 2
 const MAX_PIXELS_PER_BEAT = 16
 const ZOOM_WHEEL_SENSITIVITY = 0.0025
-const CANVAS_TILE_WIDTH = 8192
+const PIANO_ROLL_OVERSCAN = 384
+const PIANO_ROLL_GRID = [
+  { step: 1, skipEvery: 4, color: "#30303a", width: 0.75 },
+  { step: 4, skipEvery: 16, color: "#484852", width: 1 },
+  { step: 16, skipEvery: 0, color: "#71717a", width: 1.5 },
+]
 const MAX_EDIT_HISTORY = 100
 const DEFAULT_PIXELS_PER_BEAT = 4
 const ROW_HEIGHT = 28
@@ -49,13 +52,16 @@ type NoteDragOrigin = NoteSelection & {
   pitch: number
 }
 type NoteDragState = {
-  active: NoteSelection
   notes: NoteDragOrigin[]
   mode: NoteDragMode
   startX: number
   startY: number
+  anchorBeat: number
+  previousEnd: number
   playbackHeadBeat: number | null
+  historyRecorded: boolean
 }
+type PointerPosition = { clientX: number; clientY: number }
 type SelectionRect = {
   startX: number
   startY: number
@@ -64,8 +70,9 @@ type SelectionRect = {
   additive: boolean
 }
 type PianoRollRenderState = {
-  root: HTMLDivElement | null
-  isZooming: boolean
+  canvas: HTMLCanvasElement | null
+  viewportWidth: number
+  canvasLeft: number
   pitchRange: number
   pixelsPerBeat: number
   desiredCanvasWidth: number
@@ -78,6 +85,42 @@ type PianoRollRenderState = {
 }
 
 const noteSelectionKey = ({ phraseIdx, noteIdx }: NoteSelection): string => `${phraseIdx}:${noteIdx}`
+
+const editNotes = <Selection extends NoteSelection>(
+  phrases: Phrase[],
+  selection: Selection[],
+  edit: (note: UltraStarNote, selection: Selection) => UltraStarNote,
+): Phrase[] => {
+  let next: Phrase[] | undefined
+  for (const selected of selection) {
+    const { phraseIdx, noteIdx } = selected
+    const phrase = phrases[phraseIdx]
+    const note = phrase?.notes[noteIdx]
+    if (!note) continue
+    const edited = edit(note, selected)
+    if (edited === note) continue
+    next ??= phrases.slice()
+    if (next[phraseIdx] === phrase) next[phraseIdx] = { ...phrase, notes: phrase.notes.slice() }
+    next[phraseIdx].notes[noteIdx] = edited
+  }
+  return next ?? phrases
+}
+
+const MIN_NOTE_WIDTH = 3
+const phraseStats = new WeakMap<Phrase, { minPitch: number; maxPitch: number; start: number; end: number }>()
+const getPhraseStats = (phrase: Phrase) => {
+  let stats = phraseStats.get(phrase)
+  if (stats) return stats
+  stats = { minPitch: Infinity, maxPitch: -Infinity, start: Infinity, end: -Infinity }
+  for (const note of phrase.notes) {
+    stats.minPitch = Math.min(stats.minPitch, note.pitch)
+    stats.maxPitch = Math.max(stats.maxPitch, note.pitch)
+    stats.start = Math.min(stats.start, note.start_beat)
+    stats.end = Math.max(stats.end, note.start_beat + note.duration_beats)
+  }
+  phraseStats.set(phrase, stats)
+  return stats
+}
 
 export const Editor = (props: EditorProps) => {
   const jobId = () => props.jobId
@@ -93,74 +136,81 @@ export const Editor = (props: EditorProps) => {
     props.audioSourceUrl != null || props.audioSourceUrls ? "original" : "vocals",
   )
   const [isPlaying, setIsPlaying] = createSignal(false)
+  const [playRequested, setPlayRequested] = createSignal(false)
   const [saving, setSaving] = createSignal(false)
   const [saveError, setSaveError] = createSignal("")
   const [switchingMode, setSwitchingMode] = createSignal<string | null>(null)
   const [alignmentDirty, setAlignmentDirty] = createSignal(false)
   const [exportWarning, setExportWarning] = createSignal(false)
-  const [audioDuration, setAudioDuration] = createSignal(0)
+  const [loadedAudioDuration, setLoadedAudioDuration] = createSignal(0)
+  const audioDuration = createMemo(() => loadedAudioDuration() || result().audio_duration || 0)
   const [isDraggingTimeline, setIsDraggingTimeline] = createSignal(false)
   const [dragTime, setDragTime] = createSignal<number | null>(null)
   const [snapToPrevious, setSnapToPrevious] = createSignal(true)
   const [snapToPlaybackHead, setSnapToPlaybackHead] = createSignal(false)
   const [pixelsPerBeat, setPixelsPerBeat] = createSignal(DEFAULT_PIXELS_PER_BEAT)
-  const [isZooming, setIsZooming] = createSignal(false)
   const [playbackRate, setPlaybackRate] = createSignal(1)
-  const [playbackTick, setPlaybackTick] = createSignal(0)
+  const [mediaTime, setMediaTime] = createSignal(0)
   const [isExpanded, setIsExpanded] = createSignal(false)
-  const playbackTimeRef = { current: 0 }
   const pendingSeekTimeRef: { current: number | null } = { current: null }
   const timelineRef: { current: HTMLDivElement | null } = { current: null }
   const suppressTimelineClickRef = { current: false }
-  const wheelZoomTimeoutRef: { current: number | null } = { current: null }
-  const wheelZoomAnchorRef: { current: { beat: number; offsetPx: number } | null } = { current: null }
+  let lastWheelZoom = -Infinity
+  let wheelZoomFrame: number | null = null
+  let wheelZoomScale: number | null = null
+  let wheelZoomAnchor: { beat: number; offsetPx: number } | null = null
   const suspendPlayheadFollowRef = { current: false }
   const playheadBeatAtZoomRef = { current: 0 }
   const undoHistoryRef: { current: Array<JobResult["phrases"]> } = { current: [] }
   const redoHistoryRef: { current: Array<JobResult["phrases"]> } = { current: [] }
-  const historyJobIdRef = { current: props.jobId }
-  const dragHistoryRecordedRef = { current: false }
   const rafRef: { current: number | null } = { current: null }
-  const playheadRafRef: { current: number | null } = { current: null }
   const audioRef: { current: HTMLAudioElement | null } = { current: null }
-  const trackChangeTimeRef: { current: number | null } = { current: null }
-  const trackChangeWasPlayingRef = { current: false }
+  let playRequestId = 0
+  let audioJobId: string | null = null
   const pianoResumeRef: { current: PianoResumeRef | null } = { current: null }
   const canvasRef: { current: HTMLDivElement | null } = { current: null }
-  const [pianoRollElement, setPianoRollElement] = createSignal<HTMLDivElement | null>(null)
+  const [pianoRollCanvas, setPianoRollCanvas] = createSignal<HTMLCanvasElement | null>(null)
+  const [viewportWidth, setViewportWidth] = createSignal(0)
+  const [canvasLeft, setCanvasLeft] = createSignal(0)
+  let viewportScrollLeft = 0
   const noteDragRef: { current: NoteDragState | null } = { current: null }
-  const noteDragMovedRef = { current: false }
+  let pendingNoteDrag: PointerPosition | null = null
+  let noteDragFrame: number | null = null
+  let disposed = false
   const selectionDragRef: { current: SelectionRect | null } = { current: null }
   const containerRef: { current: HTMLDivElement | null } = { current: null }
   const [timelineContainer, setTimelineContainer] = createSignal<HTMLDivElement | null>(null)
   const [lyricsAlignmentOpen, setLyricsAlignmentOpen] = createSignal(false)
-  const [editorAnchor, setEditorAnchor] = createSignal<{
-    left: number
-    top: number
-    width: number
-    height: number
-  } | null>(null)
-  const displayResult = () => result()
-
-  const lastSavedPhrasesRef: { current: JobResult["phrases"] } = { current: displayResult().phrases }
-  const [savedPhrasesTick, setSavedPhrasesTick] = createSignal(0)
-  const isDirty = createMemo(() => {
-    savedPhrasesTick()
-    return displayResult().phrases !== lastSavedPhrasesRef.current
+  let editorRoot: HTMLDivElement | undefined
+  const [pianoRollOrigin, setPianoRollOrigin] = createSignal<{ left: number; top: number } | null>(null, {
+    equals: (previous, next) => previous?.left === next?.left && previous?.top === next?.top,
   })
+  const phrases = createMemo(() => result().phrases)
+  const [savedPhrases, setSavedPhrases] = createSignal(untrack(phrases))
+  const isDirty = createMemo(() => phrases() !== savedPhrases())
 
-  // Compute pitch bounds for the display
-  const allNotes = createMemo(() => displayResult().phrases.flatMap((p) => p.notes))
-  const noteMinPitch = createMemo(() => allNotes().length > 0 ? Math.min(...allNotes().map((n) => n.pitch)) : 0)
-  const noteMaxPitch = createMemo(() => allNotes().length > 0 ? Math.max(...allNotes().map((n) => n.pitch)) : 0)
-  const minPitch = createMemo(() => noteMinPitch() - 1)
-  const maxPitch = createMemo(() => noteMaxPitch() + 1)
+  const chartStats = createMemo(() => {
+    let count = 0
+    let minPitch = Infinity
+    let maxPitch = -Infinity
+    let end = -Infinity
+    for (const phrase of phrases()) {
+      const stats = getPhraseStats(phrase)
+      count += phrase.notes.length
+      minPitch = Math.min(minPitch, stats.minPitch)
+      maxPitch = Math.max(maxPitch, stats.maxPitch)
+      end = Math.max(end, stats.end)
+    }
+    return count > 0 ? { count, minPitch, maxPitch, end: end + 20 } : { count: 0, minPitch: 0, maxPitch: 0, end: 100 }
+  })
+  const minPitch = createMemo(() => chartStats().minPitch - 1)
+  const maxPitch = createMemo(() => chartStats().maxPitch + 1)
   const pitchRange = createMemo(() => maxPitch() - minPitch() + 1)
 
   const variant = createMemo(() => result().alignment_results?.[result().current_alignment_mode ?? "canonical"])
   const gap_ms_effective = createMemo(() => variant()?.gap_ms ?? result().metadata.gap_ms)
   const gap_s = createMemo(() => gap_ms_effective() / 1000)
-  const ustar_bpm = createMemo(() => displayResult().metadata.bpm * 4)
+  const ustar_bpm = createMemo(() => result().metadata.bpm * 4)
   // UltraStar note beats begin after GAP; timeline beats begin at audio 0:00.
   const secondsPerBeat = createMemo(() => 60 / (ustar_bpm() * 4))
   const gapBeats = createMemo(() => gap_s() / secondsPerBeat())
@@ -171,22 +221,19 @@ export const Editor = (props: EditorProps) => {
   // Keep the seekable strip as long as the audio, including trailing silence.
   // Previously it stopped at the last note, so clicking near the end of a
   // song could seek to an earlier position than the cursor suggested.
-  const chartEndBeat = createMemo(() => allNotes().length > 0
-    ? Math.max(...allNotes().map((n) => n.start_beat + n.duration_beats)) + 20
-    : 100)
+  const chartEndBeat = createMemo(() => chartStats().end)
   const audioEndBeat = createMemo(() => audioDuration() > 0 ? Math.max(0, audioTimeToBeat(audioDuration())) : 0)
   const totalBeats = createMemo(() => Math.max(
     chartEndBeat() + gapBeats(),
     Math.ceil(audioEndBeat()),
   ))
   const desiredCanvasWidth = createMemo(() => Math.max(1, Math.ceil(totalBeats() * pixelsPerBeat())))
-  const canvasTileCount = createMemo(() => Math.ceil(desiredCanvasWidth() / CANVAS_TILE_WIDTH))
 
   useInstrumentalPiano({
     audioRef,
     audioTrack,
     isPlaying,
-    phrases: () => displayResult().phrases,
+    phrases,
     gap_s,
     ustar_bpm,
     playbackRate,
@@ -198,115 +245,127 @@ export const Editor = (props: EditorProps) => {
     const audio = audioRef.current
     return audio?.readyState && Number.isFinite(audio.currentTime)
       ? audio.currentTime
-      : playbackTimeRef.current
+      : mediaTime()
   }
 
-  createEffect(() => {
-    const audio = audioRef.current
-    if (audio) audio.playbackRate = playbackRate()
-  }, () => undefined)
-
-  // Single value for UI: ref updated every frame when playing; sync from currentTime when paused/seek
-  const displayTime = createMemo(() => {
-    playbackTick()
-    const draggingTime = dragTime()
-    return draggingTime !== null ? draggingTime : playbackPosition()
-  })
+  const syncPlaybackPosition = () => setMediaTime(playbackPosition())
+  const displayTime = createMemo(() => dragTime() ?? mediaTime())
   const currentBeat = createMemo(() => audioTimeToBeat(displayTime()))
 
-  // Keep the editor viewport following the playhead without changing audio
-  // position. When the line leaves either side, jump the shared timeline and
-  // piano-roll scroller so the line starts the next visible section.
-  createEffect(() => {
-    const container = containerRef.current
-    if (
-      !container
-      || isDraggingTimeline()
-      || pendingSeekTimeRef.current !== null
-      || !Number.isFinite(currentBeat())
-    ) return
-    if (wheelZoomAnchorRef.current) return
-    if (suspendPlayheadFollowRef.current) {
-      if (Math.abs(currentBeat() - playheadBeatAtZoomRef.current) < 0.01) return
-      suspendPlayheadFollowRef.current = false
-    }
-    const visibleBeat = Math.max(0, Math.min(totalBeats(), currentBeat()))
-    const playheadX = visibleBeat * pixelsPerBeat()
-    const playheadWidth = 2
-    const viewportStart = container.scrollLeft
-    const viewportEnd = viewportStart + container.clientWidth
-    if (playheadX >= viewportStart && playheadX + playheadWidth <= viewportEnd) return
-    const maxScroll = Math.max(0, container.scrollWidth - container.clientWidth)
-    const nextScrollLeft = Math.min(maxScroll, Math.max(0, playheadX))
-    if (Math.abs(nextScrollLeft - container.scrollLeft) > 1) container.scrollLeft = nextScrollLeft
-  }, () => undefined)
+  const playheadX = createMemo(() => currentBeat() * pixelsPerBeat())
+  const playheadVisible = createMemo(() => currentBeat() >= 0 && currentBeat() <= totalBeats())
+  const updateViewport = (container: HTMLDivElement) => {
+    viewportScrollLeft = container.scrollLeft
+    updateCanvasLeft(viewportScrollLeft)
+  }
+  const updateCanvasLeft = (scrollLeft: number) => {
+    const page = Math.floor(scrollLeft / PIANO_ROLL_OVERSCAN)
+    setCanvasLeft(Math.max(0, (page - 1) * PIANO_ROLL_OVERSCAN))
+  }
+  const scrollLeftForZoom = (anchor: { beat: number; offsetPx: number }, scale: number) => {
+    const maxScroll = Math.max(0, Math.ceil(totalBeats() * scale) - viewportWidth())
+    return Math.min(maxScroll, Math.max(0, anchor.beat * scale - anchor.offsetPx))
+  }
+
+  // Follow the playhead one viewport at a time. Scroll and resize handlers
+  // cache the viewport geometry so the playback loop can avoid layout reads.
+  createEffect(
+    () => ({
+      container: timelineContainer(),
+      beat: currentBeat(),
+      x: playheadX(),
+      width: viewportWidth(),
+      contentWidth: desiredCanvasWidth(),
+      dragging: isDraggingTimeline(),
+    }),
+    ({ container, beat, x, width, contentWidth, dragging }) => {
+      if (
+        !container || !width || dragging || wheelZoomAnchor || performance.now() - lastWheelZoom < 120
+        || pendingSeekTimeRef.current !== null || !Number.isFinite(x)
+      ) return
+      if (suspendPlayheadFollowRef.current) {
+        if (Math.abs(beat - playheadBeatAtZoomRef.current) < 0.01) return
+        suspendPlayheadFollowRef.current = false
+      }
+      if (x >= viewportScrollLeft && x + 2 <= viewportScrollLeft + width) return
+      const nextScrollLeft = Math.min(Math.max(0, contentWidth - width), Math.max(0, x))
+      if (Math.abs(nextScrollLeft - viewportScrollLeft) <= 1) return
+      container.scrollLeft = nextScrollLeft
+      updateViewport(container)
+    },
+  )
 
   const handleTimelineWheel = (event: WheelEvent) => {
     if (!event.altKey && !event.ctrlKey) return
+    const container = containerRef.current
+    if (!container) return
     const delta = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX
     if (delta === 0) return
     event.preventDefault()
     event.stopPropagation()
-    setIsZooming(true)
-    if (wheelZoomTimeoutRef.current !== null) window.clearTimeout(wheelZoomTimeoutRef.current)
-    wheelZoomTimeoutRef.current = window.setTimeout(() => {
-      wheelZoomTimeoutRef.current = null
-      setIsZooming(false)
-    }, 120)
-    const container = containerRef.current
-    const currentScale = pixelsPerBeat()
+    const scale = pixelsPerBeat()
     const nextScale = Math.min(
       MAX_PIXELS_PER_BEAT,
-      Math.max(MIN_PIXELS_PER_BEAT, currentScale * Math.exp(-delta * ZOOM_WHEEL_SENSITIVITY)),
+      Math.max(MIN_PIXELS_PER_BEAT, (wheelZoomScale ?? scale) * Math.exp(-delta * ZOOM_WHEEL_SENSITIVITY)),
     )
-    if (nextScale === currentScale) return
-    suspendPlayheadFollowRef.current = true
-    playheadBeatAtZoomRef.current = currentBeat()
-    if (container) {
-      const rect = container.getBoundingClientRect()
-      const offsetPx = event.clientX - rect.left
-      const previousAnchor = wheelZoomAnchorRef.current
-      wheelZoomAnchorRef.current = {
-        beat: previousAnchor === null
-          ? (container.scrollLeft + offsetPx) / currentScale
-          : previousAnchor.beat + (offsetPx - previousAnchor.offsetPx) / currentScale,
-        offsetPx,
+    if (nextScale === (wheelZoomScale ?? scale)) return
+    const offsetPx = event.clientX - container.getBoundingClientRect().left
+    lastWheelZoom = performance.now()
+    wheelZoomAnchor = { beat: (container.scrollLeft + offsetPx) / scale, offsetPx }
+    wheelZoomScale = nextScale
+    if (wheelZoomFrame !== null) return
+    wheelZoomFrame = requestAnimationFrame(() => {
+      wheelZoomFrame = null
+      const next = wheelZoomScale
+      wheelZoomScale = null
+      const anchor = wheelZoomAnchor
+      if (!anchor || next === null || next === pixelsPerBeat()) {
+        wheelZoomAnchor = null
+        return
       }
-    }
-    setPixelsPerBeat(nextScale)
+      updateCanvasLeft(Math.round(scrollLeftForZoom(anchor, next)))
+      setPixelsPerBeat(next)
+    })
   }
 
-  createEffect(() => {
-    const container = timelineContainer()
-    if (!container) return
-    container.addEventListener("wheel", handleTimelineWheel, { passive: false, capture: true })
-    onCleanup(() => container.removeEventListener("wheel", handleTimelineWheel, true))
-  }, () => undefined)
+  createEffect(
+    timelineContainer,
+    (container) => {
+      if (!container) return
+      const onScroll = () => updateViewport(container)
+      const observer = new ResizeObserver(() => {
+        setViewportWidth(container.clientWidth)
+        onScroll()
+      })
+      observer.observe(container)
+      setViewportWidth(container.clientWidth)
+      onScroll()
+      container.addEventListener("scroll", onScroll, { passive: true })
+      container.addEventListener("wheel", handleTimelineWheel, { passive: false, capture: true })
+      return () => {
+        observer.disconnect()
+        container.removeEventListener("scroll", onScroll)
+        container.removeEventListener("wheel", handleTimelineWheel, true)
+        if (wheelZoomFrame !== null) cancelAnimationFrame(wheelZoomFrame)
+      }
+    },
+  )
 
-  createEffect(() => {
-    onCleanup(() => {
-      if (wheelZoomTimeoutRef.current !== null) window.clearTimeout(wheelZoomTimeoutRef.current)
-    })
-  }, () => undefined)
-
-  createPostRenderEffect(
-    () => [pixelsPerBeat(), containerRef.current] as const,
+  createEffect(
+    () => [pixelsPerBeat(), timelineContainer()] as const,
     ([scale, container]) => {
-      const anchor = wheelZoomAnchorRef.current
+      const anchor = wheelZoomAnchor
       if (!container || !anchor) return
-      const maxScroll = Math.max(0, container.scrollWidth - container.clientWidth)
       playheadBeatAtZoomRef.current = currentBeat()
       suspendPlayheadFollowRef.current = true
-      container.scrollLeft = Math.min(
-        maxScroll,
-        Math.max(0, anchor.beat * scale - anchor.offsetPx),
-      )
-      wheelZoomAnchorRef.current = null
+      container.scrollLeft = scrollLeftForZoom(anchor, scale)
+      updateViewport(container)
+      wheelZoomAnchor = null
     },
   )
 
   const recordEdit = (previous: JobResult["phrases"]) => {
-    undoHistoryRef.current.push(structuredClone(previous))
+    undoHistoryRef.current.push(previous)
     if (undoHistoryRef.current.length > MAX_EDIT_HISTORY) undoHistoryRef.current.shift()
     redoHistoryRef.current = []
   }
@@ -316,25 +375,38 @@ export const Editor = (props: EditorProps) => {
     const destination = direction === "undo" ? redoHistoryRef.current : undoHistoryRef.current
     const previous = source.pop()
     if (!previous) return
-    destination.push(structuredClone(displayResult().phrases))
+    destination.push(phrases())
     if (destination.length > MAX_EDIT_HISTORY) destination.shift()
     onResultChange({ ...result(), phrases: previous })
   }
 
-  createEffect(() => {
-    const currentJobId = jobId()
-    if (historyJobIdRef.current === currentJobId) return
+  const cancelNoteDragFrame = () => {
+    if (noteDragFrame !== null) cancelAnimationFrame(noteDragFrame)
+    noteDragFrame = null
+    pendingNoteDrag = null
+  }
+
+  onCleanup(() => {
+    disposed = true
+    cancelNoteDragFrame()
+    audioRef.current?.pause()
+  })
+
+  createEffect(jobId, (current, previous) => {
+    if (previous === undefined || previous === current) return
+    cancelNoteDragFrame()
+    noteDragRef.current = null
     undoHistoryRef.current = []
     redoHistoryRef.current = []
-    lastSavedPhrasesRef.current = displayResult().phrases
-    setSavedPhrasesTick((tick) => tick + 1)
-    historyJobIdRef.current = currentJobId
-  }, () => undefined)
+    setSavedPhrases(phrases())
+    setSaving(false)
+    setSaveError("")
+  })
 
   const totalDuration = createMemo(() => (audioDuration() > 0
     ? audioDuration()
-    : displayResult().words.length > 0
-      ? Math.max(...displayResult().words.map((w) => w.end)) + 1
+    : result().words.length > 0
+      ? Math.max(...result().words.map((w) => w.end)) + 1
       : 60))
 
   const seekByBeat = (direction: -1 | 1): boolean => {
@@ -356,7 +428,7 @@ export const Editor = (props: EditorProps) => {
     if (!audio) return false
     const currentTime = playbackPosition()
     const currentBeat = audioTimeToBeat(currentTime)
-    const boundaries = displayResult().phrases.flatMap((phrase) =>
+    const boundaries = phrases().flatMap((phrase) =>
       phrase.notes.flatMap((note) => [
         note.start_beat + gapBeats(),
         note.start_beat + note.duration_beats + gapBeats(),
@@ -381,7 +453,10 @@ export const Editor = (props: EditorProps) => {
     if (nextRate === playbackRate()) return false
     setPlaybackRate(nextRate)
     const audio = audioRef.current
-    if (audio) audio.playbackRate = nextRate
+    if (audio) {
+      audio.defaultPlaybackRate = nextRate
+      audio.playbackRate = nextRate
+    }
     return true
   }
 
@@ -393,32 +468,18 @@ export const Editor = (props: EditorProps) => {
         ? [primarySelection]
         : []
     if (selection.length === 0) return false
-    const newPhrases = structuredClone(displayResult().phrases)
-    let changed = false
-    for (const { phraseIdx, noteIdx } of selection) {
-      const note = newPhrases[phraseIdx]?.notes[noteIdx]
-      if (!note) continue
-      if (key === "ArrowLeft") {
-        const next = Math.max(0, note.start_beat - 1)
-        changed ||= next !== note.start_beat
-        note.start_beat = next
-      } else if (key === "ArrowRight") {
-        note.start_beat += 1
-        changed = true
-      } else if (key === "ArrowUp") {
-        const next = Math.min(48, note.pitch + 1)
-        changed ||= next !== note.pitch
-        note.pitch = next
-      } else if (key === "ArrowDown") {
-        const next = Math.max(-24, note.pitch - 1)
-        changed ||= next !== note.pitch
-        note.pitch = next
-      }
-      else return false
-    }
-    if (!changed) return false
-    recordEdit(displayResult().phrases)
-    onResultChange({ ...result(), phrases: newPhrases })
+    const previous = phrases()
+    const next = editNotes(previous, selection, (note) => {
+      let { start_beat, pitch } = note
+      if (key === "ArrowLeft") start_beat = Math.max(0, start_beat - 1)
+      else if (key === "ArrowRight") start_beat += 1
+      else if (key === "ArrowUp") pitch = Math.min(48, pitch + 1)
+      else if (key === "ArrowDown") pitch = Math.max(-24, pitch - 1)
+      return start_beat === note.start_beat && pitch === note.pitch ? note : { ...note, start_beat, pitch }
+    })
+    if (next === previous) return false
+    recordEdit(previous)
+    onResultChange({ ...result(), phrases: next })
     return true
   }
 
@@ -435,7 +496,7 @@ export const Editor = (props: EditorProps) => {
     } else {
       seekAudioTo(clickedTime)
     }
-    }
+  }
 
   const seekAudioTo = (time: number): void => {
     const audio = audioRef.current
@@ -444,18 +505,15 @@ export const Editor = (props: EditorProps) => {
       ? audio.duration
       : Number.POSITIVE_INFINITY
     const targetTime = Math.min(maxTime, Math.max(0, time))
-    if (
-      !audio.seeking
-      && Number.isFinite(audio.currentTime)
-      && Math.abs(audio.currentTime - targetTime) < 0.001
-    ) {
+    if (audio.readyState < HTMLMediaElement.HAVE_METADATA) {
+      pendingSeekTimeRef.current = targetTime
+    } else if (!audio.seeking && Math.abs(audio.currentTime - targetTime) < 0.001) {
       pendingSeekTimeRef.current = null
-      playbackTimeRef.current = playbackPosition()
     } else {
       pendingSeekTimeRef.current = targetTime
       audio.currentTime = targetTime
     }
-    setPlaybackTick((tick) => tick + 1)
+    syncPlaybackPosition()
     setDragTime(null)
   }
 
@@ -489,67 +547,45 @@ export const Editor = (props: EditorProps) => {
     finishTimelineSeek(true)
   }
 
-  // Global mouseup handler to stop dragging if mouse released outside timeline
-  createEffect(() => {
+  createEffect(isDraggingTimeline, (dragging) => {
+    if (!dragging) return
     const onMouseUp = () => finishTimelineSeek(false)
-    if (isDraggingTimeline()) {
-      window.addEventListener("mouseup", onMouseUp)
-      onCleanup(() => window.removeEventListener("mouseup", onMouseUp))
-    }
-  }, () => undefined)
-
-  // Global mousemove handler for dragging - throttled with requestAnimationFrame
-  createEffect(() => {
-    const onMouseMove = (e: MouseEvent) => {
-      if (isDraggingTimeline()) {
-        // Cancel any pending RAF
-        if (rafRef.current !== null) {
-          cancelAnimationFrame(rafRef.current)
-        }
-        // Schedule update on next frame for smooth 60fps updates
-        rafRef.current = requestAnimationFrame(() => {
-          if (isDraggingTimeline()) updateTimeFromMouse(e.clientX, true)
-          rafRef.current = null
-        })
-      }
-    }
-    if (isDraggingTimeline()) {
-      window.addEventListener("mousemove", onMouseMove, { passive: true })
-      onCleanup(() => {
-        window.removeEventListener("mousemove", onMouseMove)
-        if (rafRef.current !== null) {
-          cancelAnimationFrame(rafRef.current)
-          rafRef.current = null
-        }
+    const onMouseMove = (event: MouseEvent) => {
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current)
+      rafRef.current = requestAnimationFrame(() => {
+        if (isDraggingTimeline()) updateTimeFromMouse(event.clientX, true)
+        rafRef.current = null
       })
     }
-  }, () => undefined)
-
-  // One value per frame when playing: ref + tick so lyrics and scrubber stay in sync
-  createEffect(() => {
-    if (!isPlaying() || isDraggingTimeline()) return
-    const audioEl = audioRef.current
-    const tick = (): void => {
-      const a = audioRef.current
-      if (a && !a.paused && !a.seeking && pendingSeekTimeRef.current === null) {
-        playbackTimeRef.current = a.currentTime
-        setPlaybackTick((t) => t + 1)
-      }
-      playheadRafRef.current = requestAnimationFrame(tick)
+    window.addEventListener("mouseup", onMouseUp)
+    window.addEventListener("mousemove", onMouseMove, { passive: true })
+    return () => {
+      window.removeEventListener("mouseup", onMouseUp)
+      window.removeEventListener("mousemove", onMouseMove)
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
     }
-    playheadRafRef.current = requestAnimationFrame(tick)
-    onCleanup(() => {
-      if (playheadRafRef.current !== null) cancelAnimationFrame(playheadRafRef.current)
-      playheadRafRef.current = null
-      if (audioEl && !audioEl.seeking && pendingSeekTimeRef.current === null) {
-        playbackTimeRef.current = audioEl.currentTime
-        setPlaybackTick((t) => t + 1)
+  })
+
+  createEffect(
+    () => isPlaying() && !isDraggingTimeline(),
+    (running) => {
+      if (!running) return
+      const audio = audioRef.current
+      if (!audio) return
+      const tick = () => {
+        if (!audio.paused && !audio.seeking && pendingSeekTimeRef.current === null) {
+          setMediaTime(audio.currentTime)
+        }
+        frame = requestAnimationFrame(tick)
       }
-    })
-  }, () => undefined)
+      let frame = requestAnimationFrame(tick)
+      return () => cancelAnimationFrame(frame)
+    },
+  )
 
   // Keyboard: Space = play/pause, Escape = deselect notes
-  createEffect(() => {
+  createEffect(() => true, () => {
     const onKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement
       const inInput = target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable
@@ -565,20 +601,7 @@ export const Editor = (props: EditorProps) => {
       } else if (e.key === " ") {
         if (!inInput) {
           e.preventDefault()
-          const audio = audioRef.current
-          if (!audio) return
-          if (audio.paused) {
-            audio.play().then(() => setIsPlaying(true))
-          } else {
-            audio.pause()
-            if (playheadRafRef.current !== null) {
-              cancelAnimationFrame(playheadRafRef.current)
-              playheadRafRef.current = null
-            }
-            playbackTimeRef.current = playbackPosition()
-            setPlaybackTick((t) => t + 1)
-            setIsPlaying(false)
-          }
+          if (!e.repeat) togglePlayback()
         }
       } else if (!inInput && (e.key === "[" || e.key === "]")) {
         if (changePlaybackRate(e.key === "]" ? PLAYBACK_RATE_STEP : -PLAYBACK_RATE_STEP)) e.preventDefault()
@@ -601,13 +624,15 @@ export const Editor = (props: EditorProps) => {
       }
     }
     window.addEventListener("keydown", onKeyDown)
-    onCleanup(() => window.removeEventListener("keydown", onKeyDown))
-  }, () => undefined)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  })
 
-  // Draw the piano roll
+  // Draw only the viewport and a small margin. The same geometry is used
+  // during a zoom gesture and after it ends.
   const drawPianoRoll = ({
-    root,
-    isZooming,
+    canvas,
+    viewportWidth,
+    canvasLeft,
     pitchRange,
     pixelsPerBeat,
     desiredCanvasWidth,
@@ -618,104 +643,114 @@ export const Editor = (props: EditorProps) => {
     gapBeats,
     selectedNotes,
   }: PianoRollRenderState) => {
-    if (!root || isZooming) return
-    const canvases = Array.from(root.querySelectorAll("canvas"))
-    if (canvases.length === 0) return
-
+    if (!canvas || !viewportWidth) return
+    const width = Math.max(1, Math.min(viewportWidth + 2 * PIANO_ROLL_OVERSCAN, desiredCanvasWidth - canvasLeft))
     const height = pitchRange * ROW_HEIGHT
-    const dpr = 1
-    const pixelsPerBeatValue = pixelsPerBeat
-    const colors: Record<string, string> = {
-      ":": "#7c3aed",
-      "*": "#d97706",
-      "F": "#059669",
+    const ctx = canvas.getContext("2d")
+    if (!ctx) return
+    canvas.style.left = `${canvasLeft}px`
+    if (canvas.width !== width) canvas.width = width
+    if (canvas.height !== height) canvas.height = height
+    ctx.fillStyle = "#18181b"
+    ctx.fillRect(0, 0, width, height)
+
+    for (let pitch = minPitch; pitch <= maxPitch; pitch++) {
+      const y = (maxPitch - pitch) * ROW_HEIGHT
+      const midi = pitch + 60
+      const isBlackKey = [1, 3, 6, 8, 10].includes(midi % 12)
+      ctx.fillStyle = isBlackKey ? "#191923" : "#22222c"
+      ctx.fillRect(0, y, width, ROW_HEIGHT)
+      ctx.strokeStyle = midi % 12 === 0 ? "#52525b" : "#34343f"
+      ctx.lineWidth = midi % 12 === 0 ? 1 : 0.75
+      ctx.beginPath()
+      ctx.moveTo(0, y)
+      ctx.lineTo(width, y)
+      ctx.stroke()
     }
 
-    canvases.forEach((canvas, tileIndex) => {
-      const tileOffsetX = tileIndex * CANVAS_TILE_WIDTH
-      const width = Math.min(CANVAS_TILE_WIDTH, desiredCanvasWidth - tileOffsetX)
-      const ctx = canvas.getContext("2d")
-      if (!ctx || width <= 0) return
-      canvas.style.width = `${width}px`
-      canvas.style.height = `${height}px`
-      canvas.width = Math.round(width * dpr)
-      canvas.height = Math.round(height * dpr)
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-
-      ctx.fillStyle = "#18181b"
-      ctx.fillRect(0, 0, width, height)
-
-      for (let pitch = minPitch; pitch <= maxPitch; pitch++) {
-        const y = (maxPitch - pitch) * ROW_HEIGHT
-        const midi = pitch + 60
-        const isBlackKey = [1, 3, 6, 8, 10].includes(midi % 12)
-        ctx.fillStyle = isBlackKey ? "#191923" : "#22222c"
-        ctx.fillRect(0, y, width, ROW_HEIGHT)
-        ctx.strokeStyle = midi % 12 === 0 ? "#52525b" : "#34343f"
-        ctx.lineWidth = midi % 12 === 0 ? 1 : 0.75
-        ctx.beginPath()
-        ctx.moveTo(0, y)
-        ctx.lineTo(width, y)
-        ctx.stroke()
-      }
-
-      const firstBeat = Math.max(0, Math.ceil(tileOffsetX / pixelsPerBeatValue))
-      const lastBeat = Math.min(totalBeats, Math.ceil((tileOffsetX + width) / pixelsPerBeatValue))
-      for (let beat = firstBeat; beat <= lastBeat; beat++) {
-        const x = beat * pixelsPerBeatValue - tileOffsetX
-        ctx.strokeStyle = beat % 16 === 0 ? "#71717a" : beat % 4 === 0 ? "#484852" : "#30303a"
-        ctx.lineWidth = beat % 16 === 0 ? 1.5 : beat % 4 === 0 ? 1 : 0.75
-        ctx.beginPath()
+    const firstBeat = Math.max(0, Math.ceil(canvasLeft / pixelsPerBeat))
+    const lastBeat = Math.min(totalBeats, Math.ceil((canvasLeft + width) / pixelsPerBeat))
+    for (const { step, skipEvery, color, width } of PIANO_ROLL_GRID) {
+      ctx.strokeStyle = color
+      ctx.lineWidth = width
+      ctx.beginPath()
+      for (let beat = Math.ceil(firstBeat / step) * step; beat <= lastBeat; beat += step) {
+        if (skipEvery && beat % skipEvery === 0) continue
+        const x = beat * pixelsPerBeat - canvasLeft
         ctx.moveTo(x, 0)
         ctx.lineTo(x, height)
-        ctx.stroke()
       }
+      ctx.stroke()
+    }
 
-      phrases.forEach((phrase, phraseIdx) => {
+    const colors: Record<string, string> = { ":": "#7c3aed", "*": "#d97706", "F": "#059669" }
+    const selection = new Set(selectedNotes.map(noteSelectionKey))
+    const labels: { text: string; x: number; y: number; width: number }[] = []
+    phrases.forEach((phrase, phraseIdx) => {
+      const bounds = getPhraseStats(phrase)
+      const startX = (bounds.start + gapBeats) * pixelsPerBeat - canvasLeft
+      const endX = (bounds.end + gapBeats) * pixelsPerBeat - canvasLeft
+      if (startX <= width && endX + MIN_NOTE_WIDTH >= 0) {
         phrase.notes.forEach((note, noteIdx) => {
-          const x = (note.start_beat + gapBeats) * pixelsPerBeatValue - tileOffsetX
-          const y = (maxPitch - note.pitch) * ROW_HEIGHT
-          const noteWidth = note.duration_beats * pixelsPerBeatValue
+          const x = (note.start_beat + gapBeats) * pixelsPerBeat - canvasLeft
+          const noteWidth = Math.max(note.duration_beats * pixelsPerBeat, MIN_NOTE_WIDTH)
           if (x + noteWidth < 0 || x > width) return
-          const isSelected = selectedNotes.some((selection) => selection.phraseIdx === phraseIdx && selection.noteIdx === noteIdx)
+          const y = (maxPitch - note.pitch) * ROW_HEIGHT
+          const isSelected = selection.has(noteSelectionKey({ phraseIdx, noteIdx }))
           ctx.fillStyle = isSelected
             ? note.note_type === "*" ? "#fbbf24" : note.note_type === "F" ? "#6ee7b7" : "#a78bfa"
             : colors[note.note_type] ?? colors[":"]
           ctx.beginPath()
-          ctx.roundRect(x, y, Math.max(noteWidth, 3), ROW_HEIGHT - 1, 2)
+          ctx.roundRect(x, y, noteWidth, ROW_HEIGHT - 1, 2)
           ctx.fill()
           ctx.strokeStyle = isSelected ? "#e4e4e7" : "#c4b5fd"
           ctx.lineWidth = 0.75
           ctx.stroke()
+          if (noteWidth > 20 && note.text.trim()) labels.push({ text: note.text.trim(), x, y, width: noteWidth })
         })
+      }
 
-        if (phrase.end_beat > 0) {
-          const x = (phrase.end_beat + gapBeats) * pixelsPerBeatValue - tileOffsetX
-          if (x < 0 || x > width) return
-          ctx.strokeStyle = "#ef444466"
-          ctx.lineWidth = 1
-          ctx.setLineDash([4, 4])
-          ctx.beginPath()
-          ctx.moveTo(x, 0)
-          ctx.lineTo(x, height)
-          ctx.stroke()
-          ctx.setLineDash([])
-        }
-      })
+      if (phrase.end_beat > 0) {
+        const x = (phrase.end_beat + gapBeats) * pixelsPerBeat - canvasLeft
+        if (x < 0 || x > width) return
+        ctx.strokeStyle = "#ef444466"
+        ctx.lineWidth = 1
+        ctx.setLineDash([4, 4])
+        ctx.beginPath()
+        ctx.moveTo(x, 0)
+        ctx.lineTo(x, height)
+        ctx.stroke()
+        ctx.setLineDash([])
+      }
     })
+
+    ctx.font = "10px system-ui"
+    ctx.fillStyle = "#fff"
+    for (const { text, x, y, width } of labels) {
+      const available = width - 6
+      let label = text
+      if (ctx.measureText(label).width > available) {
+        let end = text.length
+        do {
+          label = `${text.slice(0, --end)}…`
+        } while (end > 0 && ctx.measureText(label).width > available)
+      }
+      ctx.fillText(label, x + 3, y + 10)
+    }
   }
 
-  createPostRenderEffect(
+  createEffect(
     (): PianoRollRenderState => ({
-      root: pianoRollElement(),
-      isZooming: isZooming(),
+      canvas: pianoRollCanvas(),
+      viewportWidth: viewportWidth(),
+      canvasLeft: canvasLeft(),
       pitchRange: pitchRange(),
       pixelsPerBeat: pixelsPerBeat(),
       desiredCanvasWidth: desiredCanvasWidth(),
       minPitch: minPitch(),
       maxPitch: maxPitch(),
       totalBeats: totalBeats(),
-      phrases: displayResult().phrases,
+      phrases: phrases(),
       gapBeats: gapBeats(),
       selectedNotes: selectedNotes(),
     }),
@@ -730,8 +765,8 @@ export const Editor = (props: EditorProps) => {
     const clickedBeat = (clientX - rect.left) / pixelsPerBeat() - gapBeats()
     const clickedPitch = maxPitch() - Math.floor(y / ROW_HEIGHT)
 
-    for (let pIdx = 0; pIdx < displayResult().phrases.length; pIdx++) {
-      const phrase = displayResult().phrases[pIdx]
+    for (let pIdx = 0; pIdx < phrases().length; pIdx++) {
+      const phrase = phrases()[pIdx]
       for (let nIdx = 0; nIdx < phrase.notes.length; nIdx++) {
         const note = phrase.notes[nIdx]
         if (
@@ -749,7 +784,7 @@ export const Editor = (props: EditorProps) => {
   const cursorForPoint = (clientX: number, clientY: number): CanvasCursor => {
     const hit = findNoteAtPoint(clientX, clientY)
     if (!hit) return "default"
-    const note = displayResult().phrases[hit.phraseIdx]?.notes[hit.noteIdx]
+    const note = phrases()[hit.phraseIdx]?.notes[hit.noteIdx]
     const root = canvasRef.current
     if (!note || !root) return "default"
     const rect = root.getBoundingClientRect()
@@ -778,7 +813,7 @@ export const Editor = (props: EditorProps) => {
     const top = Math.min(rect.startY, rect.currentY)
     const bottom = Math.max(rect.startY, rect.currentY)
     const selected: NoteSelection[] = []
-    displayResult().phrases.forEach((phrase, phraseIdx) => {
+    phrases().forEach((phrase, phraseIdx) => {
       phrase.notes.forEach((note, noteIdx) => {
         const noteLeft = (note.start_beat + gapBeats()) * pixelsPerBeat()
         const noteRight = (note.start_beat + note.duration_beats + gapBeats()) * pixelsPerBeat()
@@ -831,7 +866,7 @@ export const Editor = (props: EditorProps) => {
       event.preventDefault()
       return
     }
-    const note = displayResult().phrases[hit.phraseIdx]?.notes[hit.noteIdx]
+    const note = phrases()[hit.phraseIdx]?.notes[hit.noteIdx]
     if (!note) return
     const rect = root.getBoundingClientRect()
     const pointerBeat = (event.clientX - rect.left) / pixelsPerBeat() - gapBeats()
@@ -844,29 +879,42 @@ export const Editor = (props: EditorProps) => {
     const livePlaybackBeat = audioRef.current
       ? audioTimeToBeat(playbackPosition()) - gapBeats()
       : currentBeat() - gapBeats()
+    const chart = phrases()
+    const notes = (mode === "move" ? dragSelection : [hit]).flatMap((selection) => {
+      const selected = chart[selection.phraseIdx]?.notes[selection.noteIdx]
+      return selected ? [{
+        ...selection,
+        startBeat: selected.start_beat,
+        duration: selected.duration_beats,
+        pitch: selected.pitch,
+      }] : []
+    })
+    const anchorBeat = notes.reduce((earliest, origin) => Math.min(earliest, origin.startBeat), note.start_beat)
+    const selectedKeys = new Set(dragSelection.map(noteSelectionKey))
+    let previousEnd = 0
+    if (mode !== "end") {
+      beforeNote: for (const [phraseIdx, phrase] of chart.entries()) {
+        for (const [noteIdx, previous] of phrase.notes.entries()) {
+          if (mode === "start" && phraseIdx === hit.phraseIdx && noteIdx === hit.noteIdx) break beforeNote
+          const end = previous.start_beat + previous.duration_beats
+          if ((mode === "start" || end <= anchorBeat) && !selectedKeys.has(noteSelectionKey({ phraseIdx, noteIdx }))) {
+            previousEnd = Math.max(previousEnd, end)
+          }
+        }
+      }
+    }
     noteDragRef.current = {
-      active: hit,
-      notes: dragSelection.flatMap((selection) => {
-        const selected = displayResult().phrases[selection.phraseIdx]?.notes[selection.noteIdx]
-        return selected
-          ? [{
-              ...selection,
-              startBeat: selected.start_beat,
-              duration: selected.duration_beats,
-              pitch: selected.pitch,
-            }]
-          : []
-      }),
+      notes,
       mode,
       startX: event.clientX,
       startY: event.clientY,
+      anchorBeat,
+      previousEnd,
       playbackHeadBeat: snapToPlaybackHead() && livePlaybackBeat >= 0 && livePlaybackBeat <= totalBeats()
         ? Math.round(livePlaybackBeat)
         : null,
+      historyRecorded: false,
     }
-    noteDragMovedRef.current = false
-    dragHistoryRecordedRef.current = false
-    setSelectedNote(hit)
     setCanvasCursor("grabbing")
     event.currentTarget.setPointerCapture(event.pointerId)
     event.preventDefault()
@@ -889,95 +937,67 @@ export const Editor = (props: EditorProps) => {
       return
     }
 
-    const drag = noteDragRef.current
-    if (!drag) {
+    if (!noteDragRef.current) {
       setCanvasCursor(cursorForPoint(event.clientX, event.clientY))
       return
     }
-    setCanvasCursor("grabbing")
+    pendingNoteDrag = { clientX: event.clientX, clientY: event.clientY }
+    if (noteDragFrame !== null) return
+    noteDragFrame = requestAnimationFrame(() => {
+      const point = pendingNoteDrag
+      noteDragFrame = null
+      pendingNoteDrag = null
+      if (point) applyNoteDrag(point)
+    })
+  }
+
+  const applyNoteDrag = ({ clientX, clientY }: PointerPosition) => {
+    const drag = noteDragRef.current
     const root = canvasRef.current
-    if (!root) return
+    if (!drag || !root) return
     const rect = root.getBoundingClientRect()
     const scaleY = (pitchRange() * ROW_HEIGHT) / rect.height
-    const beatDelta = Math.round((event.clientX - drag.startX) / pixelsPerBeat())
-    const pitchDelta = -Math.round(((event.clientY - drag.startY) * scaleY) / ROW_HEIGHT)
-    const selectedKeys = new Set(drag.notes.map(noteSelectionKey))
-    const activeOrigin = drag.notes.find((origin) => noteSelectionKey(origin) === noteSelectionKey(drag.active))
-    if (!activeOrigin) return
+    const beatDelta = Math.round((clientX - drag.startX) / pixelsPerBeat())
+    const pitchDelta = -Math.round(((clientY - drag.startY) * scaleY) / ROW_HEIGHT)
     const livePlaybackHeadBeat = snapToPlaybackHead() && audioRef.current
       ? Math.round((playbackPosition() - gap_s()) / secondsPerBeat())
       : null
     const playbackHeadBeat = drag.playbackHeadBeat ?? livePlaybackHeadBeat
-    let previousEnd = 0
-    outer: for (let phraseIdx = 0; phraseIdx < displayResult().phrases.length; phraseIdx += 1) {
-      const phrase = displayResult().phrases[phraseIdx]
-      for (let noteIdx = 0; noteIdx < phrase.notes.length; noteIdx += 1) {
-        if (phraseIdx === drag.active.phraseIdx && noteIdx === drag.active.noteIdx) break outer
-        const previous = phrase.notes[noteIdx]
-        if (!selectedKeys.has(noteSelectionKey({ phraseIdx, noteIdx }))) {
-          previousEnd = Math.max(previousEnd, previous.start_beat + previous.duration_beats)
-        }
-      }
-    }
     const snapCandidate = (candidate: number, previousTarget: number): number => {
-      const targets: number[] = []
-      if (snapToPrevious() && previousTarget > 0 && Math.abs(candidate - previousTarget) <= 1.5) {
-        targets.push(previousTarget)
-      }
-      if (playbackHeadBeat !== null && Math.abs(candidate - playbackHeadBeat) <= 1.5) {
-        targets.push(playbackHeadBeat)
-      }
-      return targets.reduce((closest, target) => (
-        Math.abs(target - candidate) < Math.abs(closest - candidate) ? target : closest
-      ), targets[0] ?? candidate)
+      const previousDistance = snapToPrevious() && previousTarget > 0
+        ? Math.abs(candidate - previousTarget)
+        : Infinity
+      const playheadDistance = playbackHeadBeat === null ? Infinity : Math.abs(candidate - playbackHeadBeat)
+      if (playbackHeadBeat !== null && playheadDistance <= 1.5 && playheadDistance < previousDistance) return playbackHeadBeat
+      return previousDistance <= 1.5 ? previousTarget : candidate
     }
-    let moveBeatDelta = beatDelta
-    if (drag.mode === "move") {
-      const anchor = drag.notes.reduce((earliest, origin) => (
-        origin.startBeat < earliest.startBeat ? origin : earliest
-      ), drag.notes[0])
-      let groupPreviousEnd = 0
-      displayResult().phrases.forEach((phrase, phraseIdx) => {
-        phrase.notes.forEach((note, noteIdx) => {
-          if (selectedKeys.has(noteSelectionKey({ phraseIdx, noteIdx }))) return
-          const end = note.start_beat + note.duration_beats
-          if (end <= anchor.startBeat) groupPreviousEnd = Math.max(groupPreviousEnd, end)
-        })
-      })
-      moveBeatDelta = snapCandidate(anchor.startBeat + beatDelta, groupPreviousEnd) - anchor.startBeat
-      const earliestStart = Math.min(...drag.notes.map((origin) => origin.startBeat))
-      moveBeatDelta = Math.max(moveBeatDelta, -earliestStart)
-    }
-
-    const newPhrases = structuredClone(displayResult().phrases)
-    let changed = false
-    for (const origin of drag.notes) {
-      const note = newPhrases[origin.phraseIdx]?.notes[origin.noteIdx]
-      if (!note) continue
+    const groupStart = drag.mode === "move"
+      ? Math.max(0, snapCandidate(drag.anchorBeat + beatDelta, drag.previousEnd))
+      : drag.anchorBeat
+    const previous = phrases()
+    const next = editNotes(previous, drag.notes, (note, origin) => {
+      let start_beat = origin.startBeat
+      let duration_beats = origin.duration
       if (drag.mode === "move") {
-        note.start_beat = Math.max(0, origin.startBeat + moveBeatDelta)
-        note.pitch = Math.max(-24, Math.min(48, origin.pitch + pitchDelta))
-        changed ||= note.start_beat !== origin.startBeat || note.pitch !== origin.pitch
-      } else if (noteSelectionKey(origin) === noteSelectionKey(drag.active)) {
-        if (drag.mode === "start") {
-          const nextStart = Math.max(0, Math.min(origin.startBeat + origin.duration - 1, snapCandidate(origin.startBeat + beatDelta, previousEnd)))
-          note.start_beat = nextStart
-          note.duration_beats = origin.duration - (nextStart - origin.startBeat)
-        } else {
-          const nextEnd = Math.max(origin.startBeat + 1, snapCandidate(origin.startBeat + origin.duration + beatDelta, 0))
-          note.duration_beats = nextEnd - origin.startBeat
-        }
-        note.pitch = Math.max(-24, Math.min(48, origin.pitch + pitchDelta))
-        changed ||= note.start_beat !== origin.startBeat || note.duration_beats !== origin.duration || note.pitch !== origin.pitch
+        start_beat += groupStart - drag.anchorBeat
+      } else if (drag.mode === "start") {
+        start_beat = Math.max(0, Math.min(origin.startBeat + origin.duration - 1, snapCandidate(origin.startBeat + beatDelta, drag.previousEnd)))
+        duration_beats -= start_beat - origin.startBeat
+      } else {
+        const end = Math.max(origin.startBeat + 1, snapCandidate(origin.startBeat + origin.duration + beatDelta, 0))
+        duration_beats = end - origin.startBeat
       }
+      const pitch = Math.max(-24, Math.min(48, origin.pitch + pitchDelta))
+      return start_beat === note.start_beat && duration_beats === note.duration_beats && pitch === note.pitch
+        ? note
+        : { ...note, start_beat, duration_beats, pitch }
+    })
+    if (next === previous) return
+    if (!drag.historyRecorded) {
+      recordEdit(previous)
+      drag.historyRecorded = true
     }
-    if (!changed) return
-    noteDragMovedRef.current = true
-    if (!dragHistoryRecordedRef.current) {
-      recordEdit(displayResult().phrases)
-      dragHistoryRecordedRef.current = true
-    }
-    onResultChange({ ...result(), phrases: newPhrases })
+    onResultChange({ ...result(), phrases: next })
   }
 
   const handleCanvasPointerUp = (event: PointerEvent & { currentTarget: HTMLCanvasElement }) => {
@@ -1005,146 +1025,159 @@ export const Editor = (props: EditorProps) => {
       setSelectionRect(null)
     }
 
+    const drag = noteDragRef.current
+    const point = pendingNoteDrag
+    cancelNoteDragFrame()
+    if (drag && event.type === "pointerup" && (point || drag.historyRecorded
+      || event.clientX !== drag.startX || event.clientY !== drag.startY)) {
+      applyNoteDrag(event)
+    } else if (point) {
+      applyNoteDrag(point)
+    }
     noteDragRef.current = null
-    dragHistoryRecordedRef.current = false
     setCanvasCursor(cursorForPoint(event.clientX, event.clientY))
-    window.setTimeout(() => { noteDragMovedRef.current = false }, 0)
-  }
-
-  const updateEditorAnchor = (
-    activeNote: NoteSelection | null,
-    note: UltraStarNote | undefined,
-    gapBeatsValue: number,
-    pixelsPerBeatValue: number,
-    maxPitchValue: number,
-  ): void => {
-    if (!activeNote || !canvasRef.current) {
-      setEditorAnchor(null)
-      return
-    }
-    const root = canvasRef.current
-    const rect = root.getBoundingClientRect()
-    if (!note) {
-      setEditorAnchor(null)
-      return
-    }
-    const x = (note.start_beat + gapBeatsValue) * pixelsPerBeatValue
-    const y = (maxPitchValue - note.pitch) * ROW_HEIGHT
-    const w = note.duration_beats * pixelsPerBeatValue
-    const h = ROW_HEIGHT - 1
-    setEditorAnchor({
-      left: rect.left + x,
-      top: rect.top + y,
-      width: w,
-      height: h,
-    })
-  }
-
-  createPostRenderEffect(
-    () => {
-      const activeNote = selectedNote()
-      const note = activeNote
-        ? displayResult().phrases[activeNote.phraseIdx]?.notes[activeNote.noteIdx]
-        : undefined
-      return {
-        activeNote,
-        note,
-        gapBeats: gapBeats(),
-        pixelsPerBeat: pixelsPerBeat(),
-        maxPitch: maxPitch(),
-      }
-    },
-    ({ activeNote, note, gapBeats: gapBeatsValue, pixelsPerBeat: pixelsPerBeatValue, maxPitch: maxPitchValue }) => {
-      updateEditorAnchor(activeNote, note, gapBeatsValue, pixelsPerBeatValue, maxPitchValue)
-    },
-  )
-
-  createEffect(() => {
-    if (!selectedNote()) return
-    const container = containerRef.current
-    const onScroll = (): void => {
-      const activeNote = selectedNote()
-      updateEditorAnchor(
-        activeNote,
-        activeNote ? displayResult().phrases[activeNote.phraseIdx]?.notes[activeNote.noteIdx] : undefined,
-        gapBeats(),
-        pixelsPerBeat(),
-        maxPitch(),
-      )
-    }
-    container?.addEventListener("scroll", onScroll)
-    window.addEventListener("resize", onScroll)
-    onCleanup(() => {
-      container?.removeEventListener("scroll", onScroll)
-      window.removeEventListener("resize", onScroll)
-    })
-  }, () => undefined)
-
-  const updateNote = (field: keyof UltraStarNote, value: string | number) => {
-    const activeNote = selectedNote()
-    if (!activeNote) return
-    const newPhrases = structuredClone(displayResult().phrases)
-    const note = newPhrases[activeNote.phraseIdx].notes[activeNote.noteIdx]
-    if (note[field] === value) return
-    ;(note as Record<keyof UltraStarNote, string | number>)[field] = value
-    recordEdit(displayResult().phrases)
-    onResultChange({ ...result(), phrases: newPhrases })
-  }
-
-  const handleSave = async () => {
-    if (!isDirty() || saving()) return
-    if (props.confirmSaveMessage && !window.confirm(props.confirmSaveMessage)) return
-    setSaving(true)
-    setSaveError("")
-    try {
-      const updatedChart = props.saveNotes
-        ? await props.saveNotes(displayResult().phrases)
-        : (await updateNotes(jobId(), displayResult().phrases), undefined)
-      if (updatedChart !== undefined) {
-        onResultChange({ ...result(), ultrastar_txt: updatedChart })
-      }
-      lastSavedPhrasesRef.current = displayResult().phrases
-      setSavedPhrasesTick((tick) => tick + 1)
-    } catch (error) {
-      setSaveError(error instanceof Error ? error.message : "Failed to save changes")
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  const togglePlayback = () => {
-    const audio = audioRef.current
-    if (!audio) return
-    if (isPlaying()) {
-      audio.pause()
-      if (playheadRafRef.current !== null) {
-        cancelAnimationFrame(playheadRafRef.current)
-        playheadRafRef.current = null
-      }
-      playbackTimeRef.current = playbackPosition()
-      setPlaybackTick((t) => t + 1)
-      setIsPlaying(false)
-    } else {
-      if (audioTrack() === "instrumental_with_playback" || audioTrack() === "vocals_with_playback") {
-        pianoResumeRef.current?.resume()
-      }
-      audio.play().then(() => setIsPlaying(true))
-    }
   }
 
   const sel = createMemo(() => {
     const activeNote = selectedNote()
     return selectedNotes().length === 1 && activeNote
-      ? displayResult().phrases[activeNote.phraseIdx]?.notes[activeNote.noteIdx]
+      ? phrases()[activeNote.phraseIdx]?.notes[activeNote.noteIdx]
       : null
   })
+
+  const editorAnchor = createMemo(() => {
+    const note = sel()
+    const origin = pianoRollOrigin()
+    if (!note || !origin) return null
+    return {
+      left: origin.left + (note.start_beat + gapBeats()) * pixelsPerBeat(),
+      top: origin.top + (maxPitch() - note.pitch) * ROW_HEIGHT,
+      width: note.duration_beats * pixelsPerBeat(),
+    }
+  }, {
+    equals: (previous, next) => previous?.left === next?.left && previous?.top === next?.top && previous?.width === next?.width,
+  })
+  const hasSelectedNote = createMemo(() => Boolean(sel()))
+
+  createEffect(
+    () => [hasSelectedNote(), isExpanded()] as const,
+    ([selected]) => {
+      const root = canvasRef.current
+      if (!selected || !root) return
+
+      const measure = () => {
+        const { left, top } = root.getBoundingClientRect()
+        setPianoRollOrigin({ left, top })
+      }
+
+      let frame: number | null = null
+      const queueMeasure = (event?: Event) => {
+        if (event?.target instanceof Element && !event.target.contains(root)) return
+        if (frame !== null) return
+        frame = requestAnimationFrame(() => {
+          frame = null
+          measure()
+        })
+      }
+      const observer = new ResizeObserver(() => queueMeasure())
+      observer.observe(root)
+      if (editorRoot) observer.observe(editorRoot)
+      measure()
+      window.addEventListener("scroll", queueMeasure, { capture: true, passive: true })
+      window.addEventListener("resize", queueMeasure, { passive: true })
+      return () => {
+        window.removeEventListener("scroll", queueMeasure, true)
+        window.removeEventListener("resize", queueMeasure)
+        observer.disconnect()
+        if (frame !== null) cancelAnimationFrame(frame)
+      }
+    },
+  )
+
+  const updateNote = (field: keyof UltraStarNote, value: string | number) => {
+    const activeNote = selectedNote()
+    if (!activeNote) return
+    const previous = phrases()
+    const next = editNotes(previous, [activeNote], (note) => note[field] === value ? note : { ...note, [field]: value })
+    if (next === previous) return
+    recordEdit(previous)
+    onResultChange({ ...result(), phrases: next })
+  }
+
+  const handleSave = async () => {
+    if (!isDirty() || saving()) return
+    if (props.confirmSaveMessage && !window.confirm(props.confirmSaveMessage)) return
+    const id = jobId()
+    const submitted = phrases()
+    const isCurrent = () => !disposed && jobId() === id
+    setSaving(true)
+    setSaveError("")
+    try {
+      const updatedChart = props.saveNotes
+        ? await props.saveNotes(submitted)
+        : (await updateNotes(id, submitted), undefined)
+      if (!isCurrent()) return
+      if (updatedChart !== undefined) {
+        onResultChange({ ...result(), ultrastar_txt: updatedChart })
+      }
+      setSavedPhrases(submitted)
+    } catch (error) {
+      if (isCurrent()) setSaveError(error instanceof Error ? error.message : "Failed to save changes")
+    } finally {
+      if (isCurrent()) setSaving(false)
+    }
+  }
+
+  const startPlayback = (audio: HTMLAudioElement) => {
+    if (isPianoTrack(audioTrack())) pianoResumeRef.current?.resume()
+    const requestId = ++playRequestId
+    setPlayRequested(true)
+    void audio.play().catch(() => {
+      if (requestId === playRequestId && audio.paused) setPlayRequested(false)
+    })
+  }
+
+  const togglePlayback = () => {
+    const audio = audioRef.current
+    if (!audio) return
+    if (playRequested() || !audio.paused) {
+      ++playRequestId
+      audio.pause()
+      setPlayRequested(false)
+    } else {
+      startPlayback(audio)
+    }
+  }
+
+  const loadAudioSource = (audio: HTMLAudioElement, source: string, previousSource: string | undefined) => {
+    const sameSong = audioJobId === jobId()
+    const shouldResume = sameSong && !audio.paused
+    const time = sameSong && previousSource ? playbackPosition() : 0
+    if (!sameSong) setLoadedAudioDuration(0)
+    audioJobId = jobId()
+    ++playRequestId
+    audio.pause()
+    setIsPlaying(false)
+    setPlayRequested(false)
+    pendingSeekTimeRef.current = time > 0 ? time : null
+    setMediaTime(time)
+    audio.defaultPlaybackRate = playbackRate()
+    audio.playbackRate = playbackRate()
+    if (!source) {
+      audio.removeAttribute("src")
+      audio.load()
+      return
+    }
+    audio.src = source
+    if (shouldResume) startPlayback(audio)
+  }
 
   const selectedPitchEvidence = createMemo(() => {
     const activeNote = selectedNote()
     if (!activeNote) return undefined
-    const note = displayResult().phrases[activeNote.phraseIdx]?.notes[activeNote.noteIdx]
+    const note = phrases()[activeNote.phraseIdx]?.notes[activeNote.noteIdx]
     if (!note) return undefined
-    const pitchWords = variant()?.pitch_words ?? displayResult().pitch_words ?? displayResult().words
+    const pitchWords = variant()?.pitch_words ?? result().pitch_words ?? result().words
     const start = chartBeatToTime(note.start_beat)
     const end = chartBeatToTime(note.start_beat + note.duration_beats)
     const exactText = note.text.trim().toLowerCase()
@@ -1175,17 +1208,10 @@ export const Editor = (props: EditorProps) => {
 
   const handleAudioTrackChange = (track: AudioTrack) => {
     if (track === audioTrack()) return
-    const audio = audioRef.current
-    trackChangeTimeRef.current = audio
-      ? playbackPosition()
-      : playbackTimeRef.current
-    trackChangeWasPlayingRef.current = Boolean(audio && !audio.paused && isPlaying())
-    if (trackChangeTimeRef.current !== null) {
-      playbackTimeRef.current = trackChangeTimeRef.current
-      pendingSeekTimeRef.current = null
+    if (isPianoTrack(track) && audioRef.current && !audioRef.current.paused) {
+      pianoResumeRef.current?.resume()
     }
     setAudioTrack(track)
-    setPlaybackTick((t) => t + 1)
   }
 
   const guardedExport = () => {
@@ -1199,26 +1225,27 @@ export const Editor = (props: EditorProps) => {
 
   const handleModeChange = async (mode: "sofa" | "legacy" | "canonical") => {
     if (mode === (result().current_alignment_mode ?? "canonical")) return
+    const id = jobId()
     setSwitchingMode(mode)
     try {
-      const next = await switchAlignmentMode(jobId(), mode)
-      onResultChange(next)
-      setAlignmentDirty(false)
+      const next = await switchAlignmentMode(id, mode)
+      if (!disposed && jobId() === id) onResultChange(next)
     } catch (error) {
       console.error("Failed to switch alignment mode", error)
     } finally {
-      setSwitchingMode(null)
+      if (!disposed && jobId() === id) setSwitchingMode(null)
     }
   }
 
   return (
     <div
+      ref={(element) => { editorRoot = element }}
       class={`${isExpanded() ? "fixed inset-0 z-[80] h-dvh w-screen overflow-y-auto bg-zinc-950 p-4" : "max-w-7xl mx-auto"} space-y-6`}
     >
       <EditorHeader
         result={result()}
-        allNotesCount={allNotes().length}
-        phrasesCount={displayResult().phrases.length}
+        allNotesCount={chartStats().count}
+        phrasesCount={phrases().length}
         saving={saving()}
         isDirty={isDirty()}
         onSave={handleSave}
@@ -1257,7 +1284,7 @@ export const Editor = (props: EditorProps) => {
       <AudioControls
         jobId={jobId()}
         audioTrack={audioTrack()}
-        isPlaying={isPlaying()}
+        isPlaying={playRequested()}
         onTogglePlayback={togglePlayback}
         onAudioTrackChange={handleAudioTrackChange}
         audioSourceUrl={props.audioSourceUrl ?? undefined}
@@ -1277,48 +1304,54 @@ export const Editor = (props: EditorProps) => {
             playTestPiano()
           }
         }}
+        onSourceChange={loadAudioSource}
+        onPlaying={() => {
+          if (audioRef.current?.paused !== false) return
+          setPlayRequested(true)
+          syncPlaybackPosition()
+          setIsPlaying(true)
+        }}
+        onWaiting={() => {
+          syncPlaybackPosition()
+          setIsPlaying(false)
+        }}
+        onPause={() => {
+          if (audioRef.current?.paused !== true) return
+          setPlayRequested(false)
+          setIsPlaying(false)
+          syncPlaybackPosition()
+        }}
         onEnded={() => {
-          if (playheadRafRef.current !== null) {
-            cancelAnimationFrame(playheadRafRef.current)
-            playheadRafRef.current = null
-          }
-          const t = audioRef.current?.currentTime ?? 0
           pendingSeekTimeRef.current = null
-          playbackTimeRef.current = t
-          setPlaybackTick((tick) => tick + 1)
+          syncPlaybackPosition()
+          setPlayRequested(false)
           setIsPlaying(false)
         }}
         onTimeUpdate={() => {
           const audio = audioRef.current
-          if (
-            !isPlaying()
-            && !isDraggingTimeline()
-            && pendingSeekTimeRef.current === null
-            && audio
-            && !audio.seeking
-          ) {
-            const t = audio.currentTime
-            playbackTimeRef.current = t
-            setPlaybackTick((tick) => tick + 1)
-          }
+          if (audio?.paused && !audio.seeking && pendingSeekTimeRef.current === null) syncPlaybackPosition()
         }}
         onSeeked={() => {
           const audio = audioRef.current
-          if (!audio || !Number.isFinite(audio.currentTime)) return
+          if (!audio || audio.seeking || !Number.isFinite(audio.currentTime)) return
           const pendingTime = pendingSeekTimeRef.current
-          if (pendingTime !== null && audio.seeking) return
-          if (pendingTime !== null && Math.abs(audio.currentTime - pendingTime) > 0.05) {
+          if (
+            pendingTime !== null
+            && (audio.currentTime < pendingTime - 0.05 || (audio.paused && audio.currentTime > pendingTime + 0.05))
+          ) {
             audio.currentTime = pendingTime
             return
           }
           pendingSeekTimeRef.current = null
-          playbackTimeRef.current = audio.currentTime
-          setPlaybackTick((tick) => tick + 1)
+          syncPlaybackPosition()
         }}
-        onLoadedMetadata={() => setAudioDuration(audioRef.current?.duration ?? 0)}
+        onLoadedMetadata={() => {
+          const audio = audioRef.current
+          if (!audio) return
+          setLoadedAudioDuration(Number.isFinite(audio.duration) ? audio.duration : 0)
+          if (pendingSeekTimeRef.current !== null) seekAudioTo(pendingSeekTimeRef.current)
+        }}
         audioRef={audioRef}
-        preserveTime={trackChangeTimeRef.current}
-        resumeAfterLoad={trackChangeWasPlayingRef.current}
       />
       )}
 
@@ -1399,14 +1432,17 @@ export const Editor = (props: EditorProps) => {
           class="min-w-0 flex-1 overflow-x-auto overflow-y-hidden"
           style={{ "max-height": `${pitchRange() * ROW_HEIGHT + 48}px` }}
         >
-        <div style={{ width: `${totalBeats() * pixelsPerBeat()}px` }}>
+        <div style={{ width: `${desiredCanvasWidth()}px` }}>
           <TimelineScrubber
             totalBeats={totalBeats()}
             totalDuration={totalDuration()}
-            currentBeat={currentBeat()}
+            playheadX={playheadX()}
+            playheadVisible={playheadVisible()}
             displayTime={displayTime()}
             beatToTime={audioBeatToTime}
             pixelsPerBeat={pixelsPerBeat()}
+            visibleLeft={canvasLeft()}
+            visibleWidth={viewportWidth() + 2 * PIANO_ROLL_OVERSCAN}
             timelineRef={timelineRef}
             onTimelineClick={handleTimelineClick}
             onMouseDown={handleTimelineMouseDown}
@@ -1416,43 +1452,36 @@ export const Editor = (props: EditorProps) => {
           <div
             ref={(root) => {
               canvasRef.current = root
-              setPianoRollElement(root)
             }}
             class="relative overflow-y-auto overflow-x-hidden bg-zinc-900"
             style={{ "max-height": `${pitchRange() * ROW_HEIGHT + 20}px` }}
             aria-label="Piano roll"
           >
-            <div class="flex" style={{ width: `${desiredCanvasWidth()}px`, height: `${pitchRange() * ROW_HEIGHT}px` }}>
-              {Array.from({ length: canvasTileCount() }, (_, tileIndex) => (
-                <canvas
-                  onPointerDown={handleCanvasPointerDown}
-                  onPointerMove={handleCanvasPointerMove}
-                  onPointerLeave={() => {
-                    if (!noteDragRef.current && !selectionDragRef.current) setCanvasCursor("default")
-                  }}
-                  onPointerUp={handleCanvasPointerUp}
-                  onPointerCancel={handleCanvasPointerUp}
-                  onContextMenu={(e) => e.preventDefault()}
-                  class="block shrink-0 select-none"
-                  style={{
-                    width: `${Math.min(CANVAS_TILE_WIDTH, desiredCanvasWidth() - tileIndex * CANVAS_TILE_WIDTH)}px`,
-                    height: `${pitchRange() * ROW_HEIGHT}px`,
-                    cursor: canvasCursor(),
-                  }}
-                  aria-label={tileIndex === 0 ? "Note grid: click a note to select and edit" : undefined}
-                />
-              ))}
-            </div>
-            {displayTime() >= 0 && currentBeat() >= 0 && currentBeat() <= totalBeats() && (
-              <div
-                class="pointer-events-none absolute top-0 z-10 w-0.5 bg-pink-500 transition-none"
-                style={{
-                  left: `${currentBeat() * pixelsPerBeat()}px`,
-                  height: `${pitchRange() * ROW_HEIGHT}px`,
+            <div style={{ height: `${pitchRange() * ROW_HEIGHT}px` }}>
+              <canvas
+                ref={setPianoRollCanvas}
+                onPointerDown={handleCanvasPointerDown}
+                onPointerMove={handleCanvasPointerMove}
+                onPointerLeave={() => {
+                  if (!noteDragRef.current && !selectionDragRef.current) setCanvasCursor("default")
                 }}
-                aria-hidden="true"
+                onPointerUp={handleCanvasPointerUp}
+                onPointerCancel={handleCanvasPointerUp}
+                onContextMenu={(e) => e.preventDefault()}
+                class="absolute top-0 block select-none"
+                style={{ cursor: canvasCursor() }}
+                aria-label="Note grid: click a note to select and edit"
               />
-            )}
+            </div>
+            <div
+              class="pointer-events-none absolute left-0 top-0 z-10 w-0.5 bg-pink-500"
+              style={{
+                transform: `translateX(${playheadX()}px)`,
+                visibility: playheadVisible() ? "visible" : "hidden",
+                height: `${pitchRange() * ROW_HEIGHT}px`,
+              }}
+              aria-hidden="true"
+            />
             {selectionRect() && (
               <div
                 class="pointer-events-none absolute z-20 border border-sky-300/90 bg-sky-400/15"
@@ -1465,31 +1494,7 @@ export const Editor = (props: EditorProps) => {
                 aria-hidden="true"
               />
             )}
-            {!isZooming() && (
-              <div
-                class="pointer-events-none absolute left-0 top-0"
-                style={{ width: `${desiredCanvasWidth()}px`, height: `${pitchRange() * ROW_HEIGHT}px` }}
-                aria-hidden="true"
-              >
-                {displayResult().phrases.flatMap((phrase) => phrase.notes.map((note) => {
-                  const width = note.duration_beats * pixelsPerBeat()
-                  if (width <= 20 || !note.text.trim()) return null
-                  return (
-                    <span
-                      class="absolute overflow-hidden truncate px-[3px] text-[10px] leading-[13px] text-white"
-                      style={{
-                        left: `${(note.start_beat + gapBeats()) * pixelsPerBeat()}px`,
-                        top: `${(maxPitch() - note.pitch) * ROW_HEIGHT}px`,
-                        width: `${Math.max(width, 3)}px`,
-                        height: `${ROW_HEIGHT - 1}px`,
-                      }}
-                    >
-                      {note.text.trim()}
-                    </span>
-                  )
-                }))}
-              </div>
-            )}
+
           </div>
         </div>
         </div>
@@ -1509,9 +1514,9 @@ export const Editor = (props: EditorProps) => {
 
       {!selectedNote() && <EditorHint />}
 
-      <LyricsPreviewSection phrases={displayResult().phrases} />
+      <LyricsPreviewSection phrases={phrases()} />
 
-      <RawUltrastarSection ultrastarTxt={displayResult().ultrastar_txt} />
+      <RawUltrastarSection ultrastarTxt={result().ultrastar_txt} />
     </div>
   )
 }

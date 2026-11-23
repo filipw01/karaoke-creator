@@ -1,7 +1,6 @@
-import { createSignal, onCleanup, Show } from "solid-js"
+import { createEffect, createSignal, Show } from "solid-js"
 import { useNavigate, useParams } from "@solidjs/router"
 import { getResult, getStatus, retryJob, startProcessing } from "../api"
-import { createEffect } from "../solidCompat"
 
 export const ProcessingPage = () => {
   const params = useParams<{ jobId: string }>()
@@ -15,9 +14,16 @@ export const ProcessingPage = () => {
   const [retrying, setRetrying] = createSignal(false)
   const [retryAttempt, setRetryAttempt] = createSignal(0)
 
-  createEffect(() => {
-    retryAttempt()
-    const id = params.jobId
+  createEffect(() => [params.jobId, retryAttempt()] as const, ([id], previous) => {
+    if (previous?.[0] !== id) {
+      setTitle("Processing song")
+      setArtist("")
+      setStatus("pending")
+      setMessage("Starting processing...")
+      setProgress(0)
+      setError("")
+      setRetrying(false)
+    }
     let cancelled = false
     let timer: number
     let startAttempted = false
@@ -35,7 +41,9 @@ export const ProcessingPage = () => {
           startAttempted = true
           try {
             await startProcessing(id)
+            if (cancelled) return
           } catch (err) {
+            if (cancelled) return
             const message = err instanceof Error ? err.message : "Failed to start processing"
             if (!message.toLowerCase().includes("already started")) {
               setError(message)
@@ -68,10 +76,10 @@ export const ProcessingPage = () => {
     }).catch(() => {})
 
     void poll()
-    onCleanup(() => {
+    return () => {
       cancelled = true
       window.clearTimeout(timer)
-    })
+    }
   })
 
   const showProgress = () => ["downloading", "extracting_audio", "separating_vocals", "detecting_bpm", "searching_lyrics", "extracting_lyrics", "detecting_pitch", "aligning_words", "generating"].includes(status())

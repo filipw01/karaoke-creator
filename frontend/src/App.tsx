@@ -1,4 +1,4 @@
-import { createSignal, For, Show } from "solid-js"
+import { createMemo, createSignal, For, Show } from "solid-js"
 import type { JSX } from "@solidjs/web"
 import { createRouter, defineRoutes, hashHistory, useLocation, useNavigate } from "@solidjs/router"
 import { isTauri } from "@tauri-apps/api/core"
@@ -22,7 +22,7 @@ import { EditorPage } from "./pages/EditorPage"
 import { ExportPage } from "./pages/ExportPage"
 import { LyricsPage } from "./pages/LyricsPage"
 import { ProcessingPage } from "./pages/ProcessingPage"
-import { enqueueSong, refreshSongs, setLibraryDirectory, songQueue, startExistingSong, startSongQueue } from "./songQueue"
+import { refreshSongs, setLibraryDirectory, songQueue, startSongQueue } from "./songQueue"
 
 const WORKFLOW_STEPS: Array<{ key: AppStep; label: string }> = [
   { key: "upload", label: "Upload" },
@@ -59,14 +59,14 @@ const UploadFlow = () => {
 
   const handleUploaded = (id: string) => {
     setError("")
-    void enqueueSong(id)
+    void refreshSongs()
     navigate(`/processing/${id}`)
   }
 
   return (
     <Show when={managedJobsAvailable()} fallback={
       <p class="mx-auto max-w-2xl text-sm text-zinc-400">
-        {songQueue.songs().length ? "Select a chart to open it." : "No UltraStar charts found in this folder."}
+        {songQueue.songs.length ? "Select a chart to open it." : "No UltraStar charts found in this folder."}
       </p>
     }>
       <Show when={error()}>
@@ -114,8 +114,9 @@ const AppShell = (props: { children: JSX.Element }) => {
   let externalSongRequest = 0
   startSongQueue()
   
-  const activeJobId = () => location.pathname.split("/")[2] ?? ""
-  const activeSong = () => songQueue.songs().find(
+  const activeJobId = createMemo(() => location.pathname.split("/")[2] ?? "")
+  const selectedExternalPath = createMemo(() => externalChart()?.path)
+  const activeSong = () => songQueue.songs.find(
     (song) => song.kind === "managed" && song.id === activeJobId(),
   )
   const activeWorkflowStep = (): AppStep => {
@@ -208,9 +209,6 @@ const AppShell = (props: { children: JSX.Element }) => {
       navigate(`/editor/${id}`)
       return
     }
-    if (status === "pending") {
-      await startExistingSong(id)
-    }
     navigate(`/processing/${id}`)
   }
 
@@ -261,7 +259,7 @@ const AppShell = (props: { children: JSX.Element }) => {
   ].includes(status)
   const isSelectedSong = (song: SongListItem) => song.kind === "managed"
     ? activeJobId() === song.id
-    : externalChart()?.path === song.path
+    : selectedExternalPath() === song.path
   const exportChart = async (path: string) => {
     setLibraryError("")
     try {
@@ -379,70 +377,73 @@ const AppShell = (props: { children: JSX.Element }) => {
           </div>
           <Show when={!songQueue.loading()} fallback={<div class="px-2 text-sm text-zinc-500">Loading songs...</div>}>
             <div class="space-y-1">
-              <For each={songQueue.songs()}>
-                {(song) => (
-                  <div class={`rounded-lg border transition-colors ${isSelectedSong(song) ? "border-violet-500/40 bg-violet-500/10" : "border-transparent hover:bg-zinc-800/70"}`}>
-                    <div class="flex items-start">
-                      <button
-                        type="button"
-                        onClick={() => void openSong(song)}
-                        aria-current={isSelectedSong(song) ? "page" : undefined}
-                        class={`min-w-0 flex-1 px-3 py-2.5 text-left ${isSelectedSong(song) ? "text-white" : ""}`}
-                        title={song.kind === "external" ? `Open ${song.filename}` : song.message}
-                      >
-                        <div class="flex items-center gap-2">
-                          <Show when={song.kind === "managed" && (isWorking(song.status) || song.status === "pending")}>
-                            <div class="h-4 w-4 shrink-0 rounded-full border-2 border-violet-400 border-t-transparent animate-spin" />
-                          </Show>
-                          <Show when={song.kind === "managed" && song.status === "awaiting_lyrics"}>
-                            <div class="h-2 w-2 shrink-0 rounded-full bg-amber-400" />
-                          </Show>
-                          <Show when={song.kind === "managed" && song.status === "done"}>
-                            <div class="h-2 w-2 shrink-0 rounded-full bg-emerald-400" />
-                          </Show>
-                          <Show when={song.kind === "managed" && song.status === "error"}>
-                            <div class="h-2 w-2 shrink-0 rounded-full bg-red-400" />
-                          </Show>
-                          <Show when={song.kind === "external"}>
-                            <div class="h-2 w-2 shrink-0 rounded-full bg-sky-400" />
-                          </Show>
-                          <div class="min-w-0">
-                            <div class="truncate text-sm font-medium text-zinc-200">{song.title}</div>
-                            <div class="truncate text-xs text-zinc-500">{song.artist || song.filename}</div>
-                            <Show when={song.kind === "managed"}>
-                              <div class={`mt-1 truncate text-[11px] ${song.status === "error" ? "text-red-400" : song.status === "awaiting_lyrics" ? "text-amber-400" : "text-zinc-400"}`}>
-                                {song.queue_position ? `Queue #${song.queue_position} · ` : ""}{song.message || song.status}
-                              </div>
+              <For each={songQueue.songs}>
+                {(song) => {
+                  const isSelected = createMemo(() => isSelectedSong(song))
+                  return (
+                    <div class={`rounded-lg border transition-colors ${isSelected() ? "border-violet-500/40 bg-violet-500/10" : "border-transparent hover:bg-zinc-800/70"}`}>
+                      <div class="flex items-start">
+                        <button
+                          type="button"
+                          onClick={() => void openSong(song)}
+                          aria-current={isSelected() ? "page" : undefined}
+                          class={`min-w-0 flex-1 px-3 py-2.5 text-left ${isSelected() ? "text-white" : ""}`}
+                          title={song.kind === "external" ? `Open ${song.filename}` : song.message}
+                        >
+                          <div class="flex items-center gap-2">
+                            <Show when={song.kind === "managed" && (isWorking(song.status) || song.status === "pending")}>
+                              <div class="h-4 w-4 shrink-0 rounded-full border-2 border-violet-400 border-t-transparent animate-spin" />
                             </Show>
-                            <Show when={song.folder}>
-                              <div class="truncate text-[10px] text-zinc-600">{song.folder}</div>
+                            <Show when={song.kind === "managed" && song.status === "awaiting_lyrics"}>
+                              <div class="h-2 w-2 shrink-0 rounded-full bg-amber-400" />
                             </Show>
+                            <Show when={song.kind === "managed" && song.status === "done"}>
+                              <div class="h-2 w-2 shrink-0 rounded-full bg-emerald-400" />
+                            </Show>
+                            <Show when={song.kind === "managed" && song.status === "error"}>
+                              <div class="h-2 w-2 shrink-0 rounded-full bg-red-400" />
+                            </Show>
+                            <Show when={song.kind === "external"}>
+                              <div class="h-2 w-2 shrink-0 rounded-full bg-sky-400" />
+                            </Show>
+                            <div class="min-w-0">
+                              <div class="truncate text-sm font-medium text-zinc-200">{song.title}</div>
+                              <div class="truncate text-xs text-zinc-500">{song.artist || song.filename}</div>
+                              <Show when={song.kind === "managed"}>
+                                <div class={`mt-1 truncate text-[11px] ${song.status === "error" ? "text-red-400" : song.status === "awaiting_lyrics" ? "text-amber-400" : "text-zinc-400"}`}>
+                                  {song.queue_position ? `Queue #${song.queue_position} · ` : ""}{song.message || song.status}
+                                </div>
+                              </Show>
+                              <Show when={song.folder}>
+                                <div class="truncate text-[10px] text-zinc-600">{song.folder}</div>
+                              </Show>
+                            </div>
                           </div>
-                        </div>
-                        <Show when={song.kind === "managed" && isWorking(song.status)}>
-                          <div class="mt-2 h-1 overflow-hidden rounded-full bg-zinc-800">
-                            <div
-                              class="h-full bg-violet-500 transition-all"
-                              style={{ width: `${Math.max(8, song.progress_percent || 0)}%` }}
-                            />
-                          </div>
-                        </Show>
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Remove ${song.title}`}
-                        title={song.kind === "managed" && isWorking(song.status) ? "Cannot remove while processing" : "Remove song"}
-                        disabled={song.kind === "managed" && isWorking(song.status)}
-                        onClick={() => setPendingRemoval(song)}
-                        class="shrink-0 px-2 py-2.5 text-xs text-zinc-600 hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-30"
-                      >
-                        Remove
-                      </button>
+                          <Show when={song.kind === "managed" && isWorking(song.status)}>
+                            <div class="mt-2 h-1 overflow-hidden rounded-full bg-zinc-800">
+                              <div
+                                class="h-full bg-violet-500 transition-all"
+                                style={{ width: `${Math.max(8, song.progress_percent || 0)}%` }}
+                              />
+                            </div>
+                          </Show>
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Remove ${song.title}`}
+                          title={song.kind === "managed" && isWorking(song.status) ? "Cannot remove while processing" : "Remove song"}
+                          disabled={song.kind === "managed" && isWorking(song.status)}
+                          onClick={() => setPendingRemoval(song)}
+                          class="shrink-0 px-2 py-2.5 text-xs text-zinc-600 hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-30"
+                        >
+                          Remove
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                )}
+                  )
+                }}
               </For>
-              <Show when={songQueue.songs().length === 0}>
+              <Show when={songQueue.songs.length === 0}>
                 <div class="px-2 py-6 text-sm text-zinc-600">No songs yet</div>
               </Show>
             </div>

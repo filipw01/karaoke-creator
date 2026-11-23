@@ -1,15 +1,17 @@
-import { createMemo, onCleanup, type Accessor } from "solid-js"
-import { createEffect } from "./solidCompat"
+import { createEffect, createMemo, onCleanup, type Accessor } from "solid-js"
 import type { AudioTrack, Phrase } from "./types"
 
 const midiToFreq = (midi: number): number => 440 * 2 ** ((midi - 69) / 12)
 const PIANO_SCHEDULING_LOOKAHEAD_SEC = 0.08
 const PIANO_LATE_NOTE_WINDOW_SEC = 0.1
 
+export const isPianoTrack = (track: AudioTrack): boolean =>
+  track === "instrumental_with_playback" || track === "vocals_with_playback"
+
 /** Play a single piano-like note via Web Audio API. Optional startTime (in context time) to schedule ahead. */
 export const playPianoNote = (
   ctx: AudioContext,
-  destination: AudioDestinationNode,
+  destination: AudioNode,
   midiPitch: number,
   durationSec: number,
   volume = 0.65,
@@ -76,94 +78,95 @@ export const useInstrumentalPiano = ({
   pianoResumeRef,
 }: UseInstrumentalPianoArgs): void => {
   let ctx: AudioContext | null = null
-  const played = new Set<string>()
-  let lastTime = 0
-  let phrasesRef = phrases()
-  let timingRef = { gap_s: gap_s(), ustar_bpm: ustar_bpm(), playbackRate: playbackRate() }
+  pianoResumeRef.current = {
+    resume: () => {
+      ctx ??= new AudioContext()
+      void ctx.resume().catch(() => {})
+    },
+    getContext: () => ctx,
+  }
+  onCleanup(() => {
+    if (ctx) void ctx.close().catch(() => {})
+    pianoResumeRef.current = null
+  })
 
-  createEffect(() => {
-    phrasesRef = phrases()
-    timingRef = { gap_s: gap_s(), ustar_bpm: ustar_bpm(), playbackRate: playbackRate() }
-  }, () => undefined)
+  const chartNotes = createMemo<Phrase[]>((previous) => {
+    const next = phrases()
+    const sameSchedule = previous?.length === next.length && next.every((phrase, index) => {
+      const old = previous[index]
+      return phrase === old || (phrase.notes.length === old.notes.length && phrase.notes.every((note, noteIndex) => {
+        const oldNote = old.notes[noteIndex]
+        return note === oldNote || (
+          note.start_beat === oldNote.start_beat
+          && note.duration_beats === oldNote.duration_beats
+          && note.pitch === oldNote.pitch
+        )
+      }))
+    })
+    return sameSchedule ? previous : next
+  })
 
-  const isPianoMode = createMemo(() =>
-    audioTrack() === "instrumental_with_playback" || audioTrack() === "vocals_with_playback"
-  )
+  const scheduledNotes = createMemo(() => {
+    const secondsPerBeat = 60 / (ustar_bpm() * 4)
+    const gap = gap_s()
+    return chartNotes().flatMap((phrase) => phrase.notes.map((note) => ({
+      start: gap + note.start_beat * secondsPerBeat,
+      duration: note.duration_beats * secondsPerBeat,
+      midi: note.pitch + 60,
+    }))).sort((left, right) => left.start - right.start)
+  })
 
-  // Single effect: when piano/instrumental and playing, ensure context exists and run the note loop.
-  // Doing both in one effect avoids the loop being torn down by the other effect's deps and guarantees we have ctx.
-  createEffect(() => {
-    if (!isPianoMode() || !isPlaying()) return
-    const audio = audioRef.current
-    if (!audio) return
+  createEffect(
+    () => isPianoTrack(audioTrack()) && isPlaying()
+      ? { notes: scheduledNotes(), rate: playbackRate() }
+      : null,
+    (schedule) => {
+      const audio = audioRef.current
+      const context = ctx
+      if (!schedule || !audio || !context) return
+      const { notes, rate } = schedule
+      let nextNote = 0
+      let output: GainNode | null = null
 
-    let localCtx = ctx
-    if (!localCtx) {
-      localCtx = new AudioContext()
-      ctx = localCtx
-      const source = localCtx.createMediaElementSource(audio)
-      source.connect(localCtx.destination)
-      pianoResumeRef.current = {
-        resume: () => { ctx?.resume().catch(() => {}) },
-        getContext: () => ctx,
+      const disconnect = () => {
+        output?.disconnect()
+        output = null
       }
-    }
-    if (!localCtx) return
-    localCtx.resume().catch(() => {})
 
-    played.clear()
-    lastTime = 0
+      const tick = () => {
+        if (!audio.paused && !audio.seeking && context.state === "running") {
+          const time = audio.currentTime
+          if (!output) {
+            output = context.createGain()
+            output.connect(context.destination)
+            // Jump to the current time when playback starts or the user seeks.
+            let low = 0
+            let high = notes.length
+            while (low < high) {
+              const middle = Math.floor((low + high) / 2)
+              if (notes[middle].start < time - PIANO_LATE_NOTE_WINDOW_SEC) low = middle + 1
+              else high = middle
+            }
+            nextNote = low
+          }
 
-    // UltraStar note beats are quarter-beat subdivisions of the chart BPM.
-    // This must match Editor.tsx and backend/processing/ultrastar.py.
-    const beatToTime = (beat: number): number =>
-      (beat * 60) / (timingRef.ustar_bpm * 4) + timingRef.gap_s
-
-    const triggerNotesForTime = (t: number): void => {
-      if (t < lastTime - 0.03) played.clear()
-      lastTime = t
-      const phraseList = phrasesRef
-      const { ustar_bpm: ubpm } = timingRef
-      for (let pIdx = 0; pIdx < phraseList.length; pIdx++) {
-        const phrase = phraseList[pIdx]
-        for (let nIdx = 0; nIdx < phrase.notes.length; nIdx++) {
-          const note = phrase.notes[nIdx]
-          const startTime = beatToTime(note.start_beat)
-          const rate = Math.max(0.25, timingRef.playbackRate)
-          const durationSec = (note.duration_beats * 60) / (ubpm * 4 * rate)
-          const key = `${pIdx}-${nIdx}`
-          if (
-            startTime >= t - PIANO_LATE_NOTE_WINDOW_SEC &&
-            startTime <= t + PIANO_SCHEDULING_LOOKAHEAD_SEC &&
-            !played.has(key)
-          ) {
-            played.add(key)
-            const midiNote = note.pitch + 60
-            const startAt = localCtx.currentTime + Math.max(0, (startTime - t) / rate)
-            playPianoNote(localCtx, localCtx.destination, midiNote, durationSec, 0.65, startAt)
+          while (nextNote < notes.length && notes[nextNote].start <= time + PIANO_SCHEDULING_LOOKAHEAD_SEC * rate) {
+            const note = notes[nextNote++]
+            if (note.start < time - PIANO_LATE_NOTE_WINDOW_SEC || note.duration <= 0) continue
+            const startAt = context.currentTime + Math.max(0, (note.start - time) / rate)
+            playPianoNote(context, output, note.midi, note.duration / rate, 0.65, startAt)
           }
         }
+        frame = requestAnimationFrame(tick)
       }
-    }
 
-    let rafId = 0
-    const tick = (): void => {
-      // The media element is the source of truth for both the timeline and
-      // the audio stem. Using performance.now() here accumulated drift and
-      // made piano notes separate from a seek or a paused/resumed element.
-      const t = audio.currentTime
-      if (audio.seeking) {
-        played.clear()
-        lastTime = t
-      } else {
-        triggerNotesForTime(t)
+      audio.addEventListener("seeking", disconnect)
+      let frame = requestAnimationFrame(tick)
+      return () => {
+        cancelAnimationFrame(frame)
+        audio.removeEventListener("seeking", disconnect)
+        disconnect()
       }
-      rafId = requestAnimationFrame(tick)
-    }
-    rafId = requestAnimationFrame(tick)
-
-    onCleanup(() => {
-      cancelAnimationFrame(rafId)
-    })
-  }, () => undefined)
+    },
+  )
 }

@@ -1,5 +1,4 @@
-import { createSignal, onCleanup } from "solid-js"
-import { createEffect } from "../solidCompat"
+import { createEffect, createSignal } from "solid-js"
 import { getStatus, startProcessing } from "../api"
 
 interface ProcessingProps {
@@ -35,7 +34,7 @@ export const Processing = ({
   const [message, setMessage] = createSignal("Starting...")
   let started = false
 
-  createEffect(() => {
+  createEffect(() => undefined, () => {
     let cancelled = false
     let timerId: number
 
@@ -86,11 +85,11 @@ export const Processing = ({
 
     kickOff()
 
-    onCleanup(() => {
+    return () => {
       cancelled = true
       clearTimeout(timerId)
-    })
-  }, () => undefined)
+    }
+  })
 
   const currentStepIndex = () => STEPS.findIndex((s) => s.key === currentStatus())
 

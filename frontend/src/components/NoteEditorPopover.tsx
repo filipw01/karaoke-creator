@@ -14,7 +14,6 @@ interface EditorAnchor {
   left: number
   top: number
   width: number
-  height: number
 }
 
 interface NoteEditorPopoverProps {

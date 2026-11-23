@@ -1,5 +1,4 @@
-import { createSignal, onCleanup, Show } from "solid-js"
-import { createEffect } from "../solidCompat"
+import { createEffect, createSignal, Show } from "solid-js"
 import { useNavigate, useParams } from "@solidjs/router"
 import { confirmLyrics, getStatus } from "../api"
 
@@ -13,8 +12,10 @@ export const LyricsPage = () => {
   const [submitting, setSubmitting] = createSignal(false)
   const [error, setError] = createSignal("")
 
-  createEffect(() => {
-    const id = params.jobId
+  createEffect(() => params.jobId, (id) => {
+    setLoading(true)
+    setError("")
+    setSubmitting(false)
     let cancelled = false
 
     const load = async () => {
@@ -51,19 +52,21 @@ export const LyricsPage = () => {
       }).catch(() => {})
     }, 2000)
 
-    onCleanup(() => {
+    return () => {
       cancelled = true
       window.clearInterval(timer)
-    })
+    }
   })
 
   const approve = async (skip = false) => {
+    const id = params.jobId
     setSubmitting(true)
     setError("")
     try {
-      await confirmLyrics(params.jobId, skip ? "" : lyrics())
-      navigate(`/processing/${params.jobId}`, { replace: true })
+      await confirmLyrics(id, skip ? "" : lyrics())
+      if (params.jobId === id) navigate(`/processing/${id}`, { replace: true })
     } catch (err) {
+      if (params.jobId !== id) return
       setError(err instanceof Error ? err.message : "Failed to continue processing")
       setSubmitting(false)
     }
