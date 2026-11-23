@@ -6,12 +6,24 @@ pydantic>=2.6.0
 demucs>=4.0.1
 faster-whisper>=1.0.0
 librosa>=0.10.1
+scipy>=1.10.0
 soundfile>=0.12.1
 numpy>=1.26.0
 ffmpeg-python>=0.2.0
-torchcodec>=0.10.0
-llama-cpp-python>=0.3.0
-yt-dlp>=2024.0.0
+yt-dlp>=2026.8.19
 g2p_en>=2.1.0
-forcealign>=1.1.0
-nltk>=3.8.0
+pytest>=8.0.0
+whisperx>=3.8.1
+# Optional local LLM used for filename metadata parsing. The parser falls back
+# to a local heuristic when this package or its model is unavailable.
+# llama-cpp-python>=0.3.0
+# Optional CPU neural pitch path. ``processing.pitch`` reads the bundled ONNX
+# weight directly, so TensorFlow is not imported during pitch inference.
+# basic-pitch>=0.3.0
+# onnxruntime>=1.18.0
+# Optional CPU predominant-melody tracker used by the Basic Pitch fusion path.
+# essentia>=2.1b6.dev1389
+# Optional GPU-only song-aware ASR/forced-alignment evidence:
+# qwen-asr>=0.1.0
+# Optional CPU/GPU English Wav2Vec2 evidence:
+# forcealign>=1.1.9

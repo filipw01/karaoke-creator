@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import urllib.parse
+import urllib.request
 
 log = logging.getLogger("metadata")
 
@@ -64,6 +66,33 @@ def _clean_value(val: str) -> str:
     return val
 
 
+_TITLE_NOISE_PATTERNS = (
+    r"\bofficial\s+(?:music\s+)?(?:video|audio|visualizer)\b",
+    r"\bofficial\s+mv\b",
+    r"\bofficial\s+lyric\s+video\b",
+    r"\blyric\s*(?:video)?\b",
+    r"\b(?:music\s+)?visualizer\b",
+    r"\b(?:hq|hd|4k|8k)\b",
+    r"\bremaster(?:ed)?\b",
+    r"\b(?:audio|mv)\b",
+)
+
+
+def clean_music_title(title: str) -> str:
+    """Remove common release/presentation noise from a suggested song title."""
+    cleaned = title.rsplit(".", 1)[0] if title.lower().endswith((".mp3", ".wav", ".flac", ".m4a", ".mp4", ".mkv", ".webm", ".avi")) else title
+    cleaned = re.sub(r"\s*[\[(].*?(?:official\s+(?:music\s+)?(?:video|audio)|official\s+mv|lyrics?|lyric\s+video|visualizer|audio|remaster(?:ed)?|hq|hd|4k|8k)[^)\]]*[\])]", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*[-–—]\s*(?:official\s+(?:music\s+)?(?:video|audio)|official\s+mv|official\s+lyric\s+video|lyric\s*(?:video)?|visualizer|audio|remaster(?:ed)?|hq|hd|4k|8k)\b.*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s+(?:official\s+(?:music\s+)?(?:video|audio)|official\s+mv|official\s+lyric\s+video|lyric\s*(?:video)?|visualizer|audio|remaster(?:ed)?|hq|hd|4k|8k)\b.*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s+(?:official\s+(?:music\s+)?(?:video|audio)|official\s+mv|lyrics?|lyric\s+video|visualizer|audio|remaster(?:ed)?|hq|hd|4k|8k)\s*$", "", cleaned, flags=re.I)
+    for pattern in _TITLE_NOISE_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s+[|].*$", "", cleaned)
+    cleaned = re.sub(r"\s*[-–—]\s*(?:topic|vevo)\s*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"[\s._]+", " ", cleaned)
+    return cleaned.strip(" .-_")
+
+
 def _llm_parse(name: str) -> dict[str, str]:
     """Run inference on the local LLM using few-shot prompting."""
     llm = _get_llm()
@@ -75,7 +104,7 @@ def _llm_parse(name: str) -> dict[str, str]:
 
     result = _extract_json(content)
     return {
-        "title": _clean_value(str(result.get("title", ""))),
+        "title": clean_music_title(_clean_value(str(result.get("title", "")))),
         "artist": _clean_value(str(result.get("artist", ""))),
         "language": _clean_value(str(result.get("language", ""))),
         "year": _clean_value(str(result.get("year", ""))),
@@ -101,10 +130,36 @@ def _heuristic_parse(name: str) -> dict[str, str]:
     parts = name.split(" - ", 1)
     if len(parts) == 2:
         return {
-            "title": parts[1].strip(),
+            "title": clean_music_title(parts[1]),
             "artist": parts[0].strip(),
             "language": "",
             "year": "",
             "genre": "",
         }
-    return {"title": name.strip(), "artist": "", "language": "", "year": "", "genre": ""}
+    return {"title": clean_music_title(name), "artist": "", "language": "", "year": "", "genre": ""}
+
+
+def lookup_release_metadata(title: str, artist: str) -> dict[str, str]:
+    """Look up optional release year and genre from Apple's public catalog API."""
+    if not title:
+        return {"year": "", "genre": ""}
+
+    query = " ".join(part for part in (artist, title) if part)
+    params = urllib.parse.urlencode({"term": query, "entity": "song", "limit": 1})
+    request = urllib.request.Request(
+        f"https://itunes.apple.com/search?{params}",
+        headers={"User-Agent": "Karaoke-Creator/1.0"},
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        for result in payload.get("results", []):
+            release_date = str(result.get("releaseDate", ""))
+            year = release_date[:4] if re.match(r"^\d{4}", release_date) else ""
+            genre = str(result.get("primaryGenreName", "")).strip()
+            if year or genre:
+                return {"year": year, "genre": genre}
+    except Exception as exc:
+        log.info("Release metadata lookup failed: %s", exc)
+    return {"year": "", "genre": ""}

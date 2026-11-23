@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
+import tempfile
+import threading
+from hashlib import sha256
+from pathlib import Path
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".flv", ".wmv", ".m4v"}
+_playback_cache_lock = threading.Lock()
 
 
 def is_video_file(input_path: str) -> bool:
@@ -58,6 +64,31 @@ def extract_audio(input_path: str, output_dir: str) -> str:
     ]
     subprocess.run(cmd, check=True, capture_output=True)
     return output_path
+
+
+def playback_audio_path(source: Path, cache_dir: Path) -> Path:
+    """Use PCM for MP3 playback so the seek lands on the correct samples."""
+    if source.suffix.lower() != ".mp3":
+        return source
+
+    try:
+        info = source.stat()
+        key = sha256(os.fsencode(source))
+        key.update(f":{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}".encode())
+        cached = cache_dir / f"{key.hexdigest()}.wav"
+        if cached.is_file():
+            return cached
+
+        with _playback_cache_lock:
+            if not cached.is_file():
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(dir=cache_dir) as staging:
+                    wav = extract_audio(str(source), staging)
+                    os.replace(wav, cached)
+        return cached
+    except (OSError, subprocess.CalledProcessError):
+        logging.getLogger(__name__).exception("Could not prepare seekable audio for %s", source)
+        return source
 
 
 def convert_to_mono_16k(input_path: str, output_path: str) -> str:

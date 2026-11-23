@@ -1,104 +1,107 @@
-import { memo } from "react"
+import { createMemo } from "solid-js"
 
-const PIXELS_PER_BEAT = 8
-
-const TimelineScrubberPlayhead = memo(function TimelineScrubberPlayhead({
-  currentBeat,
-  displayTime,
-  totalBeats,
-}: {
+const TimelineScrubberPlayhead = (props: {
   currentBeat: number
   displayTime: number
   totalBeats: number
-}) {
-  if (displayTime < 0 || currentBeat < 0 || currentBeat > totalBeats) return null
+  pixelsPerBeat: number
+}) => {
+  if (props.displayTime < 0 || props.currentBeat < 0 || props.currentBeat > props.totalBeats) return null
   return (
     <div
-      className="absolute top-0 bottom-0 w-0.5 bg-pink-500 pointer-events-none z-10 transition-none"
-      style={{ left: currentBeat * PIXELS_PER_BEAT }}
+      class="absolute top-0 bottom-0 w-0.5 bg-pink-500 pointer-events-none z-10 transition-none"
+      style={{ left: `${props.currentBeat * props.pixelsPerBeat}px` }}
     >
-      <div className="absolute -top-1 left-1/2 -translate-x-1/2 w-3 h-3 bg-pink-500 rounded-full border-2 border-zinc-900" />
+      <div class="absolute -top-1 left-1/2 -translate-x-1/2 w-3 h-3 bg-pink-500 rounded-full border-2 border-zinc-900" />
     </div>
   )
-})
+}
 
-const TimelineScrubberGrid = memo(function TimelineScrubberGrid({
-  totalBeats,
-  beatToTime,
-}: {
+const TimelineScrubberGrid = (props: {
   totalBeats: number
   beatToTime: (beat: number) => number
-}) {
+  pixelsPerBeat: number
+}) => {
+  const measures = createMemo(() => Array.from(
+    { length: Math.floor(props.totalBeats / 16) + 1 },
+    (_, index) => index * 16,
+  ))
+  const timeLabels = createMemo(() => {
+    let previousLabel: string | null = null
+    return measures().flatMap((beat) => {
+      const time = props.beatToTime(beat)
+      if (time < 0) return []
+      const label = `${Math.floor(time / 60)}:${Math.floor(time % 60).toString().padStart(2, "0")}`
+      if (label === previousLabel) return []
+      previousLabel = label
+      return [{ beat, label }]
+    })
+  })
+  const measureWidth = props.pixelsPerBeat * 16
+  const beatGroupWidth = props.pixelsPerBeat * 4
   return (
-    <>
-      {Array.from({ length: Math.ceil(totalBeats / 4) + 1 }).map((_, i) => {
-        const beat = i * 4
-        const x = beat * PIXELS_PER_BEAT
-        const time = beatToTime(beat)
-        return (
-          <div
-            key={beat}
-            className="absolute top-0 bottom-0 border-l border-zinc-700/50"
-            style={{ left: x }}
-          >
-            {i % 2 === 0 && time >= 0 && (
-              <span className="absolute top-1 left-1 text-[10px] text-zinc-500 tabular-nums">
-                {Math.floor(time / 60)}:{(Math.floor(time % 60)).toString().padStart(2, "0")}
-              </span>
-            )}
-          </div>
-        )
-      })}
-    </>
+    <div
+      class="pointer-events-none absolute inset-0"
+      aria-hidden="true"
+      style={{
+        "background-image": [
+          "linear-gradient(to right, #71717a 0, #71717a 1.5px, transparent 1.5px)",
+          "linear-gradient(to right, #52525b 0, #52525b 1px, transparent 1px)",
+          "linear-gradient(to right, #3f3f46 0, #3f3f46 1px, transparent 1px)",
+        ].join(", "),
+        "background-size": `${measureWidth}px 100%, ${beatGroupWidth}px 100%, ${props.pixelsPerBeat}px 100%`,
+        "background-repeat": "repeat",
+      }}
+    >
+      {timeLabels().map(({ beat, label }) => (
+        <span
+          class="absolute top-1 left-1 text-[10px] text-zinc-500 tabular-nums"
+          style={{ left: `${beat * props.pixelsPerBeat}px` }}
+        >
+          {label}
+        </span>
+      ))}
+    </div>
   )
-})
+}
 
 interface TimelineScrubberTrackProps {
-  timelineRef: React.RefObject<HTMLDivElement | null>
+  timelineRef: { current: HTMLDivElement | null }
+  onTrackReady?: (node: HTMLDivElement | null) => void
   width: number
   totalDuration: number
   displayTime: number
-  onTimelineClick: (e: React.MouseEvent<HTMLDivElement>) => void
-  onMouseDown: (e: React.MouseEvent<HTMLDivElement>) => void
+  onTimelineClick: (e: MouseEvent & { currentTarget: HTMLDivElement }) => void
+  onMouseDown: (e: MouseEvent & { currentTarget: HTMLDivElement }) => void
   onMouseUp: () => void
-  onMouseLeave: () => void
-  onSeekKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => void
-  children: React.ReactNode
+  onSeekKeyDown: (e: KeyboardEvent & { currentTarget: HTMLDivElement }) => void
+  children?: import("@solidjs/web").JSX.Element
 }
 
-const TimelineScrubberTrack = memo(function TimelineScrubberTrack({
-  timelineRef,
-  width,
-  totalDuration,
-  displayTime,
-  onTimelineClick,
-  onMouseDown,
-  onMouseUp,
-  onMouseLeave,
-  onSeekKeyDown,
-  children,
-}: TimelineScrubberTrackProps) {
+const TimelineScrubberTrack = (props: TimelineScrubberTrackProps) => {
   return (
     <div
-      ref={timelineRef}
-      onClick={onTimelineClick}
-      onMouseDown={onMouseDown}
-      onMouseUp={onMouseUp}
-      onMouseLeave={onMouseLeave}
-      className="relative h-12 cursor-pointer select-none"
-      style={{ width }}
+      ref={(node) => {
+        props.timelineRef.current = node
+        props.onTrackReady?.(node)
+      }}
+      onClick={props.onTimelineClick}
+      onMouseDown={props.onMouseDown}
+      onMouseUp={props.onMouseUp}
+      class="relative h-12 cursor-pointer select-none"
+      style={{ width: `${props.width}px` }}
       role="slider"
       aria-label="Seek position"
       aria-valuemin={0}
-      aria-valuemax={totalDuration}
-      aria-valuenow={displayTime}
-      tabIndex={0}
-      onKeyDown={onSeekKeyDown}
+      aria-valuemax={props.totalDuration}
+      aria-valuenow={props.displayTime}
+      tabindex={0}
+      onKeyDown={props.onSeekKeyDown}
     >
-      {children}
+      {props.children}
     </div>
   )
-})
+}
 
 interface TimelineScrubberProps {
   totalBeats: number
@@ -106,47 +109,37 @@ interface TimelineScrubberProps {
   currentBeat: number
   displayTime: number
   beatToTime: (beat: number) => number
-  timelineRef: React.RefObject<HTMLDivElement | null>
-  onTimelineClick: (e: React.MouseEvent<HTMLDivElement>) => void
-  onMouseDown: (e: React.MouseEvent<HTMLDivElement>) => void
+  pixelsPerBeat: number
+  timelineRef: { current: HTMLDivElement | null }
+  onTrackReady?: (node: HTMLDivElement | null) => void
+  onTimelineClick: (e: MouseEvent & { currentTarget: HTMLDivElement }) => void
+  onMouseDown: (e: MouseEvent & { currentTarget: HTMLDivElement }) => void
   onMouseUp: () => void
-  onMouseLeave: () => void
-  onSeekKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => void
+  onSeekKeyDown: (e: KeyboardEvent & { currentTarget: HTMLDivElement }) => void
 }
 
-export const TimelineScrubber = memo(function TimelineScrubber({
-  totalBeats,
-  totalDuration,
-  currentBeat,
-  displayTime,
-  beatToTime,
-  timelineRef,
-  onTimelineClick,
-  onMouseDown,
-  onMouseUp,
-  onMouseLeave,
-  onSeekKeyDown,
-}: TimelineScrubberProps) {
+export const TimelineScrubber = (props: TimelineScrubberProps) => {
   return (
-    <section className="border-b border-zinc-700/50 bg-zinc-800/60" aria-label="Timeline">
+    <section class="border-b border-zinc-700/50 bg-zinc-800/60" aria-label="Timeline">
       <TimelineScrubberTrack
-        timelineRef={timelineRef}
-        width={totalBeats * PIXELS_PER_BEAT}
-        totalDuration={totalDuration}
-        displayTime={displayTime}
-        onTimelineClick={onTimelineClick}
-        onMouseDown={onMouseDown}
-        onMouseUp={onMouseUp}
-        onMouseLeave={onMouseLeave}
-        onSeekKeyDown={onSeekKeyDown}
+        timelineRef={props.timelineRef}
+        onTrackReady={props.onTrackReady}
+        width={props.totalBeats * props.pixelsPerBeat}
+        totalDuration={props.totalDuration}
+        displayTime={props.displayTime}
+        onTimelineClick={props.onTimelineClick}
+        onMouseDown={props.onMouseDown}
+        onMouseUp={props.onMouseUp}
+        onSeekKeyDown={props.onSeekKeyDown}
       >
-        <TimelineScrubberGrid totalBeats={totalBeats} beatToTime={beatToTime} />
+        <TimelineScrubberGrid totalBeats={props.totalBeats} beatToTime={props.beatToTime} pixelsPerBeat={props.pixelsPerBeat} />
         <TimelineScrubberPlayhead
-          currentBeat={currentBeat}
-          displayTime={displayTime}
-          totalBeats={totalBeats}
+          currentBeat={props.currentBeat}
+          displayTime={props.displayTime}
+          totalBeats={props.totalBeats}
+          pixelsPerBeat={props.pixelsPerBeat}
         />
       </TimelineScrubberTrack>
     </section>
   )
-})
+}

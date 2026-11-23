@@ -1,8 +1,10 @@
 __pycache__/
 venv/
+.venv/
 uploads/
 outputs/
 nltk_data/
 optional_aligners/
+benchmarks/private/
 .env.optional
 .DS_Store

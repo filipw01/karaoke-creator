@@ -1,79 +1,141 @@
-import { memo } from "react"
+import { For, onCleanup } from "solid-js"
+import { createEffect } from "../solidCompat"
+import type { AudioTrack } from "../types"
 import { getAudioUrl } from "../api"
+
+export type { AudioTrack } from "../types"
 
 interface AudioControlsProps {
   jobId: string
-  audioTrack: "original" | "vocals" | "instrumental"
+  audioTrack: AudioTrack
   isPlaying: boolean
   onTogglePlayback: () => void
-  onAudioTrackChange: (track: "original" | "vocals" | "instrumental") => void
+  onAudioTrackChange: (track: AudioTrack) => void
   onEnded: () => void
   onTimeUpdate: () => void
+  onSeeked: () => void
   onLoadedMetadata: () => void
-  audioRef: React.RefObject<HTMLAudioElement | null>
+  onTestSound: () => void
+  audioRef: { current: HTMLAudioElement | null }
+  audioSourceUrl?: string
+  audioSourceUrls?: Partial<Record<AudioTrack, string>>
+  availableTracks?: AudioTrack[]
+  showTrackSelection?: boolean
+  preserveTime?: number | null
+  resumeAfterLoad?: boolean
 }
 
-export const AudioControls = memo(function AudioControls({
-  jobId,
-  audioTrack,
-  isPlaying,
-  onTogglePlayback,
-  onAudioTrackChange,
-  onEnded,
-  onTimeUpdate,
-  onLoadedMetadata,
-  audioRef,
-}: AudioControlsProps) {
+const AUDIO_TRACK_OPTIONS: Array<[AudioTrack, string]> = [
+  ["original", "Original"],
+  ["vocals", "Vocal"],
+  ["instrumental", "Instrumental"],
+  ["instrumental_with_playback", "Instrumental with Playback"],
+  ["vocals_with_playback", "Vocal with Playback"],
+]
+
+export const AudioControls = (props: AudioControlsProps) => {
+  const sourceUrl = (): string => {
+    if (props.audioSourceUrls) {
+      const sourceTrack = props.audioTrack === "instrumental_with_playback"
+        ? "instrumental"
+        : props.audioTrack === "vocals_with_playback"
+          ? "vocals"
+          : props.audioTrack
+      return props.audioSourceUrls[sourceTrack] ?? ""
+    }
+    return props.audioSourceUrl ?? getAudioUrl(props.jobId, props.audioTrack)
+  }
+
+  createEffect(() => {
+    const source = sourceUrl()
+    const audio = props.audioRef.current
+    if (!audio) return
+    if (source && audio.src === new URL(source, document.baseURI).href && audio.readyState >= 1) return
+    // The same element is reused for all stems (important for Web Audio's
+    // MediaElementSource), so explicitly restart its resource when the track
+    // changes instead of relying on the browser's src mutation timing.
+    const savedTime = props.preserveTime ?? audio.currentTime
+    const shouldResume = props.resumeAfterLoad ?? false
+    let restored = false
+    const restorePosition = (): void => {
+      if (restored) return
+      restored = true
+      const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : Number.POSITIVE_INFINITY
+      audio.currentTime = Math.min(Math.max(0, savedTime), duration)
+      if (shouldResume) void audio.play().catch(() => {})
+    }
+    audio.pause()
+    audio.src = source
+    audio.addEventListener("loadedmetadata", restorePosition)
+    audio.load()
+    if (audio.readyState >= 1) restorePosition()
+    onCleanup(() => audio.removeEventListener("loadedmetadata", restorePosition))
+  }, () => undefined)
+
   return (
     <section
-      className="flex items-center gap-4 bg-zinc-800/60 border border-zinc-700/50 rounded-xl p-4"
+      class="flex flex-wrap items-center gap-4 bg-zinc-800/60 border border-zinc-700/50 rounded-xl p-4"
       aria-label="Playback controls"
     >
       <button
         type="button"
-        onClick={onTogglePlayback}
-        aria-label={isPlaying ? "Pause" : "Play"}
-        className="w-10 h-10 flex items-center justify-center bg-violet-600 hover:bg-violet-500
+        onClick={props.onTogglePlayback}
+        aria-label={props.isPlaying ? "Pause" : "Play"}
+        class="w-10 h-10 flex items-center justify-center bg-violet-600 hover:bg-violet-500
                    rounded-full transition-colors shrink-0 cursor-pointer"
       >
-        {isPlaying ? (
-          <svg className="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24">
+        {props.isPlaying ? (
+          <svg class="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24">
             <rect x="6" y="4" width="4" height="16" />
             <rect x="14" y="4" width="4" height="16" />
           </svg>
         ) : (
-          <svg className="w-5 h-5 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
+          <svg class="w-5 h-5 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
             <polygon points="5,3 19,12 5,21" />
           </svg>
         )}
       </button>
 
-      <div className="flex gap-1" role="group" aria-label="Audio track">
-        {(["original", "vocals", "instrumental"] as const).map((track) => (
-          <button
-            key={track}
-            type="button"
-            aria-pressed={audioTrack === track}
-            aria-label={`Use ${track} track`}
-            onClick={() => onAudioTrackChange(track)}
-            className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
-              audioTrack === track
-                ? "bg-violet-600 text-white"
-                : "bg-zinc-700 text-zinc-300 hover:bg-zinc-600"
-            }`}
-          >
-            {track.charAt(0).toUpperCase() + track.slice(1)}
-          </button>
-        ))}
-      </div>
+      {props.showTrackSelection !== false && (
+        <div class="flex flex-wrap gap-1" role="group" aria-label="Audio track">
+          <For each={AUDIO_TRACK_OPTIONS.filter(([track]) => !props.availableTracks || props.availableTracks.includes(track))}>
+            {([track, label]) => (
+            <button
+              type="button"
+              aria-pressed={props.audioTrack === track ? "true" : "false"}
+              aria-label={label}
+              onClick={() => props.onAudioTrackChange(track)}
+              class={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
+                props.audioTrack === track
+                  ? "bg-violet-600 text-white"
+                  : "bg-zinc-700 text-zinc-300 hover:bg-zinc-600"
+              }`}
+            >
+              {label}
+            </button>
+            )}
+          </For>
+        </div>
+      )}
+
+      <button
+        type="button"
+        onClick={props.onTestSound}
+        aria-label="Test piano sound"
+        class="px-3 py-1.5 rounded-lg text-sm font-medium bg-zinc-700 text-zinc-300 hover:bg-zinc-600 transition-colors cursor-pointer"
+      >
+        Test sound
+      </button>
 
       <audio
-        ref={audioRef}
-        src={getAudioUrl(jobId, audioTrack)}
-        onEnded={onEnded}
-        onTimeUpdate={onTimeUpdate}
-        onLoadedMetadata={onLoadedMetadata}
+        ref={(audio) => { props.audioRef.current = audio }}
+        src={sourceUrl()}
+        preload="auto"
+        onEnded={props.onEnded}
+        onTimeUpdate={props.onTimeUpdate}
+        onSeeked={props.onSeeked}
+        onLoadedMetadata={props.onLoadedMetadata}
       />
     </section>
   )
-})
+}

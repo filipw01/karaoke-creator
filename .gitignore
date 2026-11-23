@@ -1,0 +1,20 @@
+# Local operating system and editor files
+.DS_Store
+.codex/
+.llm/
+
+# Python caches and local test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.matplotlib/
+
+# Local virtual environments
+.venv/
+venv/
+
+# Accidental root-level npm install artifacts (the app lives in frontend/)
+/node_modules/
+/package-lock.json

@@ -1,14 +1,12 @@
-import { useEffect, useRef, useState } from "react"
+import { createSignal, onCleanup } from "solid-js"
+import { createEffect } from "../solidCompat"
 import { getStatus, startProcessing } from "../api"
 
 interface ProcessingProps {
   jobId: string
-  /** Phase 1 done — awaiting lyrics review */
   onAwaitingLyrics: (foundLyrics: string) => void
-  /** Full pipeline done (Phase 2 complete) */
   onDone: () => void
   onError: (error: string) => void
-  /** If true, skip calling start (Phase 2 was triggered externally) */
   resumePolling?: boolean
 }
 
@@ -17,26 +15,35 @@ const STEPS = [
   { key: "separating_vocals", label: "Separating vocals" },
   { key: "detecting_bpm", label: "Detecting BPM" },
   { key: "searching_lyrics", label: "Searching for lyrics online" },
-  { key: "extracting_lyrics", label: "Transcribing lyrics" },
+  { key: "awaiting_lyrics", label: "Review lyrics" },
+  { key: "extracting_lyrics", label: "Preparing lyric evidence" },
   { key: "detecting_pitch", label: "Analyzing pitch" },
+  { key: "aligning_words", label: "Aligning words" },
   { key: "generating", label: "Generating UltraStar file" },
 ] as const
 
 const POLL_INTERVAL = 2000
 
-export const Processing = ({ jobId, onAwaitingLyrics, onDone, onError, resumePolling }: ProcessingProps) => {
-  const [currentStatus, setCurrentStatus] = useState("pending")
-  const [message, setMessage] = useState("Starting...")
-  const startedRef = useRef(false)
+export const Processing = ({
+  jobId,
+  onAwaitingLyrics,
+  onDone,
+  onError,
+  resumePolling = false,
+}: ProcessingProps) => {
+  const [currentStatus, setCurrentStatus] = createSignal("pending")
+  const [message, setMessage] = createSignal("Starting...")
+  let started = false
 
-  useEffect(() => {
+  createEffect(() => {
     let cancelled = false
     let timerId: number
 
     const kickOff = async () => {
-      // Only call start once across StrictMode double-mount (skip if resuming)
-      if (!startedRef.current && !resumePolling) {
-        startedRef.current = true
+      // Only call start once across StrictMode double-mount. A review
+      // confirmation resumes the same job and must not restart Phase 1.
+      if (!started && !resumePolling) {
+        started = true
         try {
           await startProcessing(jobId)
         } catch (err) {
@@ -44,7 +51,7 @@ export const Processing = ({ jobId, onAwaitingLyrics, onDone, onError, resumePol
           return
         }
       }
-      startedRef.current = true
+      started = true
 
       const poll = async () => {
         if (cancelled) return
@@ -79,52 +86,51 @@ export const Processing = ({ jobId, onAwaitingLyrics, onDone, onError, resumePol
 
     kickOff()
 
-    return () => {
+    onCleanup(() => {
       cancelled = true
       clearTimeout(timerId)
-    }
-  }, [jobId, onAwaitingLyrics, onDone, onError, resumePolling])
+    })
+  }, () => undefined)
 
-  const currentStepIndex = STEPS.findIndex((s) => s.key === currentStatus)
+  const currentStepIndex = () => STEPS.findIndex((s) => s.key === currentStatus())
 
   return (
-    <div className="max-w-xl mx-auto">
-      <div className="text-center mb-10">
-        <h2 className="text-3xl font-bold text-white mb-2">Processing Your Song</h2>
-        <p className="text-zinc-400">{message}</p>
+    <div class="max-w-xl mx-auto">
+      <div class="text-center mb-10">
+        <h2 class="text-3xl font-bold text-white mb-2">Processing Your Song</h2>
+        <p class="text-zinc-400">{message()}</p>
       </div>
 
-      <div className="space-y-3">
+      <div class="space-y-3">
         {STEPS.map((step, i) => {
-          const isActive = step.key === currentStatus
-          const isDone = currentStepIndex > i || currentStatus === "done"
-          const isPending = currentStepIndex < i && currentStatus !== "done"
+          const isActive = step.key === currentStatus()
+          const isDone = currentStepIndex() > i || currentStatus() === "done"
+          const isPending = currentStepIndex() < i && currentStatus() !== "done"
 
           return (
             <div
-              key={step.key}
-              className={`
+              class={`
                 flex items-center gap-3 p-4 rounded-xl transition-all duration-300
                 ${isActive ? "bg-violet-500/15 border border-violet-500/30" : ""}
                 ${isDone ? "bg-emerald-500/10 border border-emerald-500/20" : ""}
                 ${isPending ? "bg-zinc-800/50 border border-zinc-700/30 opacity-50" : ""}
               `}
             >
-              <div className="flex-shrink-0 w-8 h-8 flex items-center justify-center">
+              <div class="flex-shrink-0 w-8 h-8 flex items-center justify-center">
                 {isDone && (
-                  <svg className="w-6 h-6 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                  <svg class="w-6 h-6 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width={2.5}>
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
                   </svg>
                 )}
                 {isActive && (
-                  <div className="w-5 h-5 border-2 border-violet-400 border-t-transparent rounded-full animate-spin" />
+                  <div class="w-5 h-5 border-2 border-violet-400 border-t-transparent rounded-full animate-spin" />
                 )}
                 {isPending && (
-                  <div className="w-3 h-3 rounded-full bg-zinc-600" />
+                  <div class="w-3 h-3 rounded-full bg-zinc-600" />
                 )}
               </div>
 
-              <span className={`font-medium ${
+              <span class={`font-medium ${
                 isActive ? "text-violet-300" :
                 isDone ? "text-emerald-400" :
                 "text-zinc-500"
@@ -136,14 +142,14 @@ export const Processing = ({ jobId, onAwaitingLyrics, onDone, onError, resumePol
         })}
       </div>
 
-      <div className="mt-8">
-        <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
+      <div class="mt-8">
+        <div class="h-2 bg-zinc-800 rounded-full overflow-hidden">
           <div
-            className="h-full bg-gradient-to-r from-violet-500 to-fuchsia-500 rounded-full transition-all duration-500"
+            class="h-full bg-gradient-to-r from-violet-500 to-fuchsia-500 rounded-full transition-all duration-500"
             style={{
-              width: currentStatus === "done"
+              width: currentStatus() === "done"
                 ? "100%"
-                : `${Math.max(5, ((currentStepIndex + 1) / STEPS.length) * 100)}%`
+                : `${Math.max(5, ((currentStepIndex() + 1) / STEPS.length) * 100)}%`,
             }}
           />
         </div>

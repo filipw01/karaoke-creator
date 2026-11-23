@@ -1,70 +1,101 @@
-import { memo } from "react"
+import { createMemo } from "solid-js"
 import type { JobResult } from "../types"
 
 interface EditorHeaderProps {
   result: JobResult
   allNotesCount: number
   phrasesCount: number
-  showSettings: boolean
-  onToggleSettings: () => void
   saving: boolean
   isDirty: boolean
   onSave: () => void
   onExport: () => void
+  onOpenLyricsAlignment: () => void
+  onModeChange: (mode: "sofa" | "legacy" | "canonical") => void
+  switchingMode: string | null
+  showLyricsAlignment?: boolean
+  showExport?: boolean
 }
 
-export const EditorHeader = memo(function EditorHeader({
-  result,
-  allNotesCount,
-  phrasesCount,
-  showSettings,
-  onToggleSettings,
-  saving,
-  isDirty,
-  onSave,
-  onExport,
-}: EditorHeaderProps) {
+export const EditorHeader = (props: EditorHeaderProps) => {
+  const comparison = createMemo(() => props.result.alignment_comparison)
+  const modes = createMemo(() => ["sofa", "legacy"].filter((mode) => props.result.alignment_results?.[mode]) as Array<"sofa" | "legacy">)
+  const currentMode = createMemo(() => props.result.current_alignment_mode === "canonical" && props.result.alignment_results?.sofa
+    ? "sofa"
+    : props.result.current_alignment_mode ?? "canonical")
+  const confidence = createMemo(() => comparison()?.confidence)
   return (
-    <div className="flex items-center justify-between">
+    <div class="flex items-start justify-between gap-4">
       <div>
-        <h2 className="text-2xl font-bold text-white">
-          {result.metadata.artist} — {result.metadata.title}
+        <h2 class="text-2xl font-bold text-white">
+          {props.result.metadata.artist} — {props.result.metadata.title}
         </h2>
-        <p className="text-zinc-400 text-sm">
-          BPM: {result.metadata.bpm.toFixed(1)} | GAP: {result.metadata.gap_ms.toFixed(0)}ms
-          | {allNotesCount} notes in {phrasesCount} phrases
+        <p class="text-zinc-400 text-sm">
+          BPM: {props.result.metadata.bpm.toFixed(1)} | GAP: {props.result.metadata.gap_ms.toFixed(0)}ms
+          | {props.allNotesCount} notes in {props.phrasesCount} phrases
         </p>
+        {modes().length > 0 && (
+          <div class="mt-3 flex items-center gap-2 flex-wrap">
+            <span class="text-xs text-zinc-500">Alignment:</span>
+            {modes().map((mode) => (
+              <button
+                type="button"
+                onClick={() => props.onModeChange(mode)}
+                disabled={props.switchingMode !== null}
+                class={`px-2.5 py-1 rounded-md text-xs transition-colors ${
+                  currentMode() === mode
+                    ? "bg-violet-600 text-white"
+                    : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+                } disabled:opacity-50`}
+              >
+                {props.switchingMode === mode ? "Switching…" : mode.toUpperCase()}
+              </button>
+            ))}
+            {comparison()?.status === "running" && (
+              <span class="text-xs text-amber-300">Legacy processing in background…</span>
+            )}
+            {comparison()?.status === "completed" && typeof confidence() === "number" && (
+              <span class="text-xs text-zinc-400" title="Agreement between SOFA and legacy timing/pitch results">
+                Agreement {Math.round(confidence()! * 100)}%
+                {typeof comparison()!.timing_agreement === "number" && typeof comparison()!.pitch_agreement === "number"
+                  ? ` · timing ${Math.round(comparison()!.timing_agreement! * 100)}% · pitch ${Math.round(comparison()!.pitch_agreement! * 100)}%`
+                  : ""}
+              </span>
+            )}
+          </div>
+        )}
       </div>
-      <div className="flex gap-2">
+      <div class="flex gap-2">
+        {props.showLyricsAlignment !== false && (
+          <button
+            type="button"
+            onClick={props.onOpenLyricsAlignment}
+            class="bg-zinc-700 hover:bg-zinc-600 text-white px-4 py-2 rounded-lg transition-colors"
+          >
+            Lyrics &amp; alignment
+          </button>
+        )}
         <button
           type="button"
-          onClick={onToggleSettings}
-          className={`px-4 py-2 rounded-lg transition-colors cursor-pointer ${
-            showSettings ? "bg-fuchsia-600 text-white" : "bg-zinc-700 hover:bg-zinc-600 text-white"
-          }`}
-        >
-          Lyrics Settings
-        </button>
-        <button
-          type="button"
-          onClick={onSave}
-          disabled={saving}
-          aria-busy={saving}
-          aria-label={saving ? "Saving changes" : isDirty ? "Save unsaved changes" : "Save changes"}
-          className="bg-zinc-700 hover:bg-zinc-600 text-white px-4 py-2 rounded-lg
+          onClick={props.onSave}
+          disabled={props.saving}
+          aria-busy={props.saving ? "true" : "false"}
+          aria-label={props.saving ? "Saving changes" : props.isDirty ? "Save unsaved changes" : "Save changes"}
+          class="bg-zinc-700 hover:bg-zinc-600 text-white px-4 py-2 rounded-lg
                      transition-colors disabled:opacity-50 cursor-pointer"
         >
-          {saving ? "Saving..." : isDirty ? "Save changes (unsaved)" : "Save Changes"}
+          {props.saving ? "Saving..." : props.isDirty ? "Save changes (unsaved)" : "Save Changes"}
         </button>
-        <button
-          type="button"
-          onClick={onExport}
-          className="bg-violet-600 hover:bg-violet-500 text-white px-4 py-2 rounded-lg
-                     transition-colors cursor-pointer"
-        >
-          Export
-        </button>
+        {props.showExport !== false && (
+          <button
+            type="button"
+            onClick={props.onExport}
+            class="bg-violet-600 hover:bg-violet-500 text-white px-4 py-2 rounded-lg
+                       transition-colors cursor-pointer"
+          >
+            Export
+          </button>
+        )}
       </div>
     </div>
   )
-})
+}

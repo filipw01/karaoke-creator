@@ -1,6 +1,21 @@
-import type { JobResult, LyricsParams } from "./types"
+import type {
+  AlignmentRun,
+  AudioTrack,
+  JobResult,
+  LyricLanguage,
+  LyricRevision,
+  SongMetadata,
+  WordAlignment,
+} from "./types"
 
 const BASE = "/api"
+const API_TOKEN = (import.meta.env.VITE_KARAOKE_API_TOKEN as string | undefined)?.trim()
+
+const apiHeaders = (json = false): Record<string, string> => ({
+  ...(json ? { "Content-Type": "application/json" } : {}),
+  ...(API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {}),
+})
+const authQuery = API_TOKEN ? `?access_token=${encodeURIComponent(API_TOKEN)}` : ""
 
 export const uploadFile = async (
   file: File,
@@ -14,20 +29,43 @@ export const uploadFile = async (
   form.append("genre", metadata.genre)
   form.append("year", metadata.year)
 
-  const res = await fetch(`${BASE}/upload`, { method: "POST", body: form })
-  if (!res.ok) throw new Error("Upload failed")
+  const res = await fetch(`${BASE}/upload`, { method: "POST", headers: apiHeaders(), body: form })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Upload failed" }))
+    throw new Error(error.detail ?? "Upload failed")
+  }
   const data = await res.json()
   return data.job_id as string
 }
 
 export const startProcessing = async (jobId: string): Promise<void> => {
-  const res = await fetch(`${BASE}/process/${jobId}/start`, { method: "POST" })
-  if (!res.ok) throw new Error("Failed to start processing")
+  const res = await fetch(`${BASE}/process/${jobId}/start`, { method: "POST", headers: apiHeaders() })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Failed to start processing" }))
+    throw new Error(error.detail ?? "Failed to start processing")
+  }
 }
 
 export const getResult = async (jobId: string): Promise<JobResult> => {
-  const res = await fetch(`${BASE}/jobs/${jobId}/result`)
-  if (!res.ok) throw new Error("Failed to get result")
+  const res = await fetch(`${BASE}/jobs/${jobId}/result`, { headers: apiHeaders() })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Failed to get result" }))
+    throw new Error(error.detail ?? "Failed to get result")
+  }
+  return res.json()
+}
+
+export const getAlignment = async (jobId: string): Promise<{
+  job_id: string
+  status: string
+  lyric_revision: LyricRevision
+  word_alignments: Array<WordAlignment>
+  alignment_run: AlignmentRun | null
+  last_completed_alignment_run?: AlignmentRun | null
+  latest_alignment_run?: AlignmentRun | null
+}> => {
+  const res = await fetch(`${BASE}/jobs/${jobId}/alignment`, { headers: apiHeaders() })
+  if (!res.ok) throw new Error("Failed to get word alignment")
   return res.json()
 }
 
@@ -37,27 +75,22 @@ export const updateNotes = async (
 ): Promise<void> => {
   const res = await fetch(`${BASE}/jobs/${jobId}/notes`, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: apiHeaders(true),
     body: JSON.stringify({ phrases }),
   })
   if (!res.ok) throw new Error("Failed to update notes")
 }
 
-export const getAudioUrl = (jobId: string, track: "original" | "vocals" | "instrumental"): string =>
-  `${BASE}/jobs/${jobId}/audio/${track}`
+export const getAudioUrl = (
+  jobId: string,
+  track: AudioTrack
+): string => {
+  const sourceTrack = track.endsWith("_with_playback") ? track.replace("_with_playback", "") : track
+  return `${BASE}/jobs/${jobId}/audio/${sourceTrack}${authQuery}`
+}
 
 export const getDownloadUrl = (jobId: string): string =>
-  `${BASE}/jobs/${jobId}/download`
-
-export const regenerateLyrics = async (jobId: string, params: Partial<LyricsParams>): Promise<JobResult> => {
-  const res = await fetch(`${BASE}/jobs/${jobId}/regenerate-lyrics`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(params),
-  })
-  if (!res.ok) throw new Error("Failed to regenerate lyrics")
-  return res.json()
-}
+  `${BASE}/jobs/${jobId}/download${authQuery}`
 
 export interface LyricsSearchResult {
   track_name: string
@@ -68,12 +101,116 @@ export interface LyricsSearchResult {
   source: string
 }
 
+export const confirmLyrics = async (jobId: string, lyrics: string): Promise<void> => {
+  const res = await fetch(`${BASE}/jobs/${jobId}/confirm-lyrics`, {
+    method: "POST",
+    headers: apiHeaders(true),
+    body: JSON.stringify({ lyrics }),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Failed to confirm lyrics" }))
+    throw new Error(error.detail ?? "Failed to confirm lyrics")
+  }
+}
+
 export const searchLyricsOnline = async (query: string): Promise<Array<LyricsSearchResult>> => {
   if (!query.trim()) return []
-  const res = await fetch(`${BASE}/lyrics/search?${new URLSearchParams({ q: query.trim() })}`)
+  const res = await fetch(`${BASE}/lyrics/search?${new URLSearchParams({ q: query.trim() })}`, {
+    headers: apiHeaders(),
+  })
   if (!res.ok) throw new Error("Search failed")
   const data = await res.json()
-  return data.results
+  return data.results as Array<LyricsSearchResult>
+}
+
+export const saveLyricRevision = async (
+  jobId: string,
+  rawText: string,
+  language: LyricLanguage,
+): Promise<LyricRevision> => {
+  const res = await fetch(`${BASE}/jobs/${jobId}/lyric-revisions`, {
+    method: "POST",
+    headers: apiHeaders(true),
+    body: JSON.stringify({ raw_text: rawText, language }),
+  })
+  if (!res.ok) throw new Error("Failed to save lyric revision")
+  const data = await res.json()
+  return data.revision as LyricRevision
+}
+
+export const startAlignmentRun = async (
+  jobId: string,
+  lyricRevisionId: string,
+  resetTokenIds: Array<string> = [],
+  alignmentBackend: "sofa" | "legacy" = "sofa",
+): Promise<{ alignment_run_id: string; lyric_revision_id: string; status: string }> => {
+  const res = await fetch(`${BASE}/jobs/${jobId}/alignment-runs`, {
+    method: "POST",
+    headers: apiHeaders(true),
+    body: JSON.stringify({
+      lyric_revision_id: lyricRevisionId,
+      reset_token_ids: resetTokenIds,
+      alignment_backend: alignmentBackend,
+    }),
+  })
+  if (!res.ok) throw new Error("Failed to start alignment")
+  return res.json()
+}
+
+export const startAlignmentComparison = async (
+  jobId: string,
+  lyricRevisionId?: string,
+): Promise<{ status: string; alignment_comparison?: JobResult["alignment_comparison"] }> => {
+  const res = await fetch(`${BASE}/jobs/${jobId}/alignment-comparison`, {
+    method: "POST",
+    headers: apiHeaders(true),
+    body: JSON.stringify(lyricRevisionId ? { lyric_revision_id: lyricRevisionId } : {}),
+  })
+  if (!res.ok) throw new Error("Failed to start alignment comparison")
+  return res.json()
+}
+
+export const switchAlignmentMode = async (
+  jobId: string,
+  mode: "sofa" | "legacy" | "canonical",
+): Promise<JobResult> => {
+  const res = await fetch(`${BASE}/jobs/${jobId}/alignment-mode`, {
+    method: "PATCH",
+    headers: apiHeaders(true),
+    body: JSON.stringify({ mode }),
+  })
+  if (!res.ok) throw new Error("Failed to switch alignment version")
+  return res.json()
+}
+
+export const updateWordAlignment = async (
+  jobId: string,
+  tokenId: string,
+  boundaries: { start?: number; end?: number },
+): Promise<WordAlignment> => {
+  const res = await fetch(`${BASE}/jobs/${jobId}/word-alignments/${encodeURIComponent(tokenId)}`, {
+    method: "PATCH",
+    headers: apiHeaders(true),
+    body: JSON.stringify(boundaries),
+  })
+  if (!res.ok) throw new Error("Failed to save word boundary")
+  const data = await res.json()
+  return data.alignment as WordAlignment
+}
+
+export const resetWordAlignment = async (
+  jobId: string,
+  tokenId: string,
+  boundaries: Array<"start" | "end"> = ["start", "end"],
+): Promise<WordAlignment> => {
+  const res = await fetch(`${BASE}/jobs/${jobId}/word-alignments/${encodeURIComponent(tokenId)}/reset`, {
+    method: "POST",
+    headers: apiHeaders(true),
+    body: JSON.stringify({ boundaries }),
+  })
+  if (!res.ok) throw new Error("Failed to reset word boundary")
+  const data = await res.json()
+  return data.alignment as WordAlignment
 }
 
 export interface ParsedFilename {
@@ -87,28 +224,172 @@ export interface ParsedFilename {
 export const parseFilename = async (filename: string): Promise<ParsedFilename> => {
   const res = await fetch(`${BASE}/parse-filename`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: apiHeaders(true),
     body: JSON.stringify({ filename }),
   })
   if (!res.ok) throw new Error("Failed to parse filename")
   return res.json()
 }
 
-export const confirmLyrics = async (jobId: string, lyrics: string): Promise<void> => {
-  const res = await fetch(`${BASE}/jobs/${jobId}/confirm-lyrics`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ lyrics }),
+export interface SongListItem {
+  id: string
+  kind: "managed" | "external"
+  title: string
+  artist: string
+  filename: string
+  folder?: string
+  path?: string
+  status: string
+  message: string
+  progress_percent: number
+  error?: string
+  failed_phase?: string
+  queue_position?: number
+}
+
+export const listSongs = async (): Promise<{ working_directory: string | null; songs: Array<SongListItem> }> => {
+  const res = await fetch(`${BASE}/library`, { headers: apiHeaders() })
+  if (!res.ok) throw new Error("Failed to list songs")
+  return res.json()
+}
+
+export const setWorkingDirectory = async (directory: string): Promise<string> => {
+  const res = await fetch(`${BASE}/library/working-directory`, {
+    method: "PUT",
+    headers: apiHeaders(true),
+    body: JSON.stringify({ directory }),
   })
-  if (!res.ok) throw new Error("Failed to confirm lyrics")
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Unable to set working directory" }))
+    throw new Error(error.detail ?? "Unable to set working directory")
+  }
+  const data = await res.json()
+  return data.directory as string
+}
+
+export interface ExternalSong {
+  path: string
+  filename: string
+  content: string
+  metadata: SongMetadata
+  phrases: JobResult["phrases"]
+  audio_available: boolean
+  stems_available: boolean
+  separation_status: ExternalSongSeparationStatus["status"]
+  separation_error?: string
+}
+
+export interface ExternalSongSeparationStatus {
+  status: "idle" | "separating" | "done" | "error"
+  error?: string
+}
+
+export const getExternalSong = async (path: string): Promise<ExternalSong> => {
+  const res = await fetch(`${BASE}/library/external-song?${new URLSearchParams({ path })}`, {
+    headers: apiHeaders(),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Failed to open song file" }))
+    throw new Error(error.detail ?? "Failed to open song file")
+  }
+  return res.json()
+}
+
+export const saveExternalSong = async (
+  path: string,
+  phrases: JobResult["phrases"],
+): Promise<string> => {
+  const res = await fetch(`${BASE}/library/external-song?${new URLSearchParams({ path })}`, {
+    method: "PUT",
+    headers: apiHeaders(true),
+    body: JSON.stringify({ phrases }),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Failed to save song chart" }))
+    throw new Error(error.detail ?? "Failed to save song chart")
+  }
+  const data: { content: string } = await res.json()
+  return data.content
+}
+
+export const startExternalSongSeparation = async (path: string): Promise<ExternalSongSeparationStatus> => {
+  const res = await fetch(`${BASE}/library/external-song/split?${new URLSearchParams({ path })}`, {
+    method: "POST",
+    headers: apiHeaders(),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Failed to split song audio" }))
+    throw new Error(error.detail ?? "Failed to split song audio")
+  }
+  return res.json()
+}
+
+export const getExternalSongSeparationStatus = async (path: string): Promise<ExternalSongSeparationStatus> => {
+  const res = await fetch(`${BASE}/library/external-song/split-status?${new URLSearchParams({ path })}`, {
+    headers: apiHeaders(),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Failed to get separation status" }))
+    throw new Error(error.detail ?? "Failed to get separation status")
+  }
+  return res.json()
+}
+
+export const getExternalSongAudioUrl = (
+  path: string,
+  track: Extract<AudioTrack, "original" | "vocals" | "instrumental"> = "original",
+): string => {
+  const query = new URLSearchParams({ path, track })
+  if (API_TOKEN) query.set("access_token", API_TOKEN)
+  return `${BASE}/library/external-song/audio?${query}`
+}
+
+export const getExternalSongDownloadUrl = (path: string): string => {
+  const query = new URLSearchParams({ path })
+  if (API_TOKEN) query.set("access_token", API_TOKEN)
+  return `${BASE}/library/external-song/download?${query}`
+}
+
+export const removeSong = async (song: SongListItem): Promise<void> => {
+  const query = song.kind === "managed"
+    ? new URLSearchParams({ job_id: song.id })
+    : new URLSearchParams({ path: song.path ?? "" })
+  const res = await fetch(`${BASE}/library/song?${query}`, {
+    method: "DELETE",
+    headers: apiHeaders(),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Failed to remove song" }))
+    throw new Error(error.detail ?? "Failed to remove song")
+  }
 }
 
 export const getStatus = async (
   jobId: string,
-): Promise<{ status: string; message: string; error?: string; found_lyrics?: string; progress_percent?: number }> => {
-  const res = await fetch(`${BASE}/jobs/${jobId}/status`)
-  if (!res.ok) throw new Error("Failed to get status")
+): Promise<{
+  status: string
+  message: string
+  metadata?: { title: string; artist: string }
+  error?: string
+  found_lyrics?: string
+  progress_percent?: number
+  lyric_revision_id?: string
+  alignment_run?: AlignmentRun
+}> => {
+  const res = await fetch(`${BASE}/jobs/${jobId}/status`, { headers: apiHeaders() })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Failed to get job status" }))
+    throw new Error(error.detail ?? "Failed to get job status")
+  }
   return res.json()
+}
+
+export const retryJob = async (jobId: string): Promise<void> => {
+  const res = await fetch(`${BASE}/jobs/${jobId}/retry`, { method: "POST", headers: apiHeaders() })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Failed to retry processing" }))
+    throw new Error(error.detail ?? "Failed to retry processing")
+  }
 }
 
 export interface YouTubeSearchResult {
@@ -124,7 +405,7 @@ export const searchYouTube = async (query: string): Promise<Array<YouTubeSearchR
   if (!query.trim()) return []
   const res = await fetch(`${BASE}/youtube/search`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: apiHeaders(true),
     body: JSON.stringify({ query: query.trim() }),
   })
   if (!res.ok) throw new Error("YouTube search failed")
@@ -138,7 +419,7 @@ export const downloadYouTube = async (
 ): Promise<string> => {
   const res = await fetch(`${BASE}/youtube/download`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: apiHeaders(true),
     body: JSON.stringify({ url, ...metadata }),
   })
   if (!res.ok) {
