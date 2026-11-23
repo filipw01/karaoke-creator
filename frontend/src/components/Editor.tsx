@@ -106,14 +106,16 @@ const editNotes = <Selection extends NoteSelection>(
   return next ?? phrases
 }
 
-const phraseStats = new WeakMap<Phrase, { minPitch: number; maxPitch: number; end: number }>()
+const MIN_NOTE_WIDTH = 3
+const phraseStats = new WeakMap<Phrase, { minPitch: number; maxPitch: number; start: number; end: number }>()
 const getPhraseStats = (phrase: Phrase) => {
   let stats = phraseStats.get(phrase)
   if (stats) return stats
-  stats = { minPitch: Infinity, maxPitch: -Infinity, end: -Infinity }
+  stats = { minPitch: Infinity, maxPitch: -Infinity, start: Infinity, end: -Infinity }
   for (const note of phrase.notes) {
     stats.minPitch = Math.min(stats.minPitch, note.pitch)
     stats.maxPitch = Math.max(stats.maxPitch, note.pitch)
+    stats.start = Math.min(stats.start, note.start_beat)
     stats.end = Math.max(stats.end, note.start_beat + note.duration_beats)
   }
   phraseStats.set(phrase, stats)
@@ -179,12 +181,10 @@ export const Editor = (props: EditorProps) => {
   const containerRef: { current: HTMLDivElement | null } = { current: null }
   const [timelineContainer, setTimelineContainer] = createSignal<HTMLDivElement | null>(null)
   const [lyricsAlignmentOpen, setLyricsAlignmentOpen] = createSignal(false)
-  const [editorAnchor, setEditorAnchor] = createSignal<{
-    left: number
-    top: number
-    width: number
-    height: number
-  } | null>(null)
+  let editorRoot: HTMLDivElement | undefined
+  const [pianoRollOrigin, setPianoRollOrigin] = createSignal<{ left: number; top: number } | null>(null, {
+    equals: (previous, next) => previous?.left === next?.left && previous?.top === next?.top,
+  })
   const phrases = createMemo(() => result().phrases)
   const [savedPhrases, setSavedPhrases] = createSignal(untrack(phrases))
   const isDirty = createMemo(() => phrases() !== savedPhrases())
@@ -687,23 +687,28 @@ export const Editor = (props: EditorProps) => {
     const selection = new Set(selectedNotes.map(noteSelectionKey))
     const labels: { text: string; x: number; y: number; width: number }[] = []
     phrases.forEach((phrase, phraseIdx) => {
-      phrase.notes.forEach((note, noteIdx) => {
-        const x = (note.start_beat + gapBeats) * pixelsPerBeat - canvasLeft
-        const noteWidth = Math.max(note.duration_beats * pixelsPerBeat, 3)
-        if (x + noteWidth < 0 || x > width) return
-        const y = (maxPitch - note.pitch) * ROW_HEIGHT
-        const isSelected = selection.has(noteSelectionKey({ phraseIdx, noteIdx }))
-        ctx.fillStyle = isSelected
-          ? note.note_type === "*" ? "#fbbf24" : note.note_type === "F" ? "#6ee7b7" : "#a78bfa"
-          : colors[note.note_type] ?? colors[":"]
-        ctx.beginPath()
-        ctx.roundRect(x, y, noteWidth, ROW_HEIGHT - 1, 2)
-        ctx.fill()
-        ctx.strokeStyle = isSelected ? "#e4e4e7" : "#c4b5fd"
-        ctx.lineWidth = 0.75
-        ctx.stroke()
-        if (noteWidth > 20 && note.text.trim()) labels.push({ text: note.text.trim(), x, y, width: noteWidth })
-      })
+      const bounds = getPhraseStats(phrase)
+      const startX = (bounds.start + gapBeats) * pixelsPerBeat - canvasLeft
+      const endX = (bounds.end + gapBeats) * pixelsPerBeat - canvasLeft
+      if (startX <= width && endX + MIN_NOTE_WIDTH >= 0) {
+        phrase.notes.forEach((note, noteIdx) => {
+          const x = (note.start_beat + gapBeats) * pixelsPerBeat - canvasLeft
+          const noteWidth = Math.max(note.duration_beats * pixelsPerBeat, MIN_NOTE_WIDTH)
+          if (x + noteWidth < 0 || x > width) return
+          const y = (maxPitch - note.pitch) * ROW_HEIGHT
+          const isSelected = selection.has(noteSelectionKey({ phraseIdx, noteIdx }))
+          ctx.fillStyle = isSelected
+            ? note.note_type === "*" ? "#fbbf24" : note.note_type === "F" ? "#6ee7b7" : "#a78bfa"
+            : colors[note.note_type] ?? colors[":"]
+          ctx.beginPath()
+          ctx.roundRect(x, y, noteWidth, ROW_HEIGHT - 1, 2)
+          ctx.fill()
+          ctx.strokeStyle = isSelected ? "#e4e4e7" : "#c4b5fd"
+          ctx.lineWidth = 0.75
+          ctx.stroke()
+          if (noteWidth > 20 && note.text.trim()) labels.push({ text: note.text.trim(), x, y, width: noteWidth })
+        })
+      }
 
       if (phrase.end_beat > 0) {
         const x = (phrase.end_beat + gapBeats) * pixelsPerBeat - canvasLeft
@@ -1033,73 +1038,58 @@ export const Editor = (props: EditorProps) => {
     setCanvasCursor(cursorForPoint(event.clientX, event.clientY))
   }
 
-  const updateEditorAnchor = (
-    activeNote: NoteSelection | null,
-    note: UltraStarNote | undefined,
-    gapBeatsValue: number,
-    pixelsPerBeatValue: number,
-    maxPitchValue: number,
-  ): void => {
-    if (!activeNote || !canvasRef.current) {
-      setEditorAnchor(null)
-      return
+  const sel = createMemo(() => {
+    const activeNote = selectedNote()
+    return selectedNotes().length === 1 && activeNote
+      ? phrases()[activeNote.phraseIdx]?.notes[activeNote.noteIdx]
+      : null
+  })
+
+  const editorAnchor = createMemo(() => {
+    const note = sel()
+    const origin = pianoRollOrigin()
+    if (!note || !origin) return null
+    return {
+      left: origin.left + (note.start_beat + gapBeats()) * pixelsPerBeat(),
+      top: origin.top + (maxPitch() - note.pitch) * ROW_HEIGHT,
+      width: note.duration_beats * pixelsPerBeat(),
     }
-    const root = canvasRef.current
-    const rect = root.getBoundingClientRect()
-    if (!note) {
-      setEditorAnchor(null)
-      return
-    }
-    const x = (note.start_beat + gapBeatsValue) * pixelsPerBeatValue
-    const y = (maxPitchValue - note.pitch) * ROW_HEIGHT
-    const w = note.duration_beats * pixelsPerBeatValue
-    const h = ROW_HEIGHT - 1
-    setEditorAnchor({
-      left: rect.left + x,
-      top: rect.top + y,
-      width: w,
-      height: h,
-    })
-  }
+  }, {
+    equals: (previous, next) => previous?.left === next?.left && previous?.top === next?.top && previous?.width === next?.width,
+  })
+  const hasSelectedNote = createMemo(() => Boolean(sel()))
 
   createEffect(
-    () => {
-      const activeNote = selectedNote()
-      const note = activeNote
-        ? phrases()[activeNote.phraseIdx]?.notes[activeNote.noteIdx]
-        : undefined
-      return {
-        activeNote,
-        note,
-        gapBeats: gapBeats(),
-        pixelsPerBeat: pixelsPerBeat(),
-        maxPitch: maxPitch(),
-      }
-    },
-    ({ activeNote, note, gapBeats: gapBeatsValue, pixelsPerBeat: pixelsPerBeatValue, maxPitch: maxPitchValue }) => {
-      updateEditorAnchor(activeNote, note, gapBeatsValue, pixelsPerBeatValue, maxPitchValue)
-    },
-  )
+    () => [hasSelectedNote(), isExpanded()] as const,
+    ([selected]) => {
+      const root = canvasRef.current
+      if (!selected || !root) return
 
-  createEffect(
-    () => selectedNote() ? timelineContainer() : null,
-    (container) => {
-      if (!container) return
-      const onScroll = (): void => {
-        const activeNote = selectedNote()
-        updateEditorAnchor(
-          activeNote,
-          activeNote ? phrases()[activeNote.phraseIdx]?.notes[activeNote.noteIdx] : undefined,
-          gapBeats(),
-          pixelsPerBeat(),
-          maxPitch(),
-        )
+      const measure = () => {
+        const { left, top } = root.getBoundingClientRect()
+        setPianoRollOrigin({ left, top })
       }
-      container.addEventListener("scroll", onScroll)
-      window.addEventListener("resize", onScroll)
+
+      let frame: number | null = null
+      const queueMeasure = (event?: Event) => {
+        if (event?.target instanceof Element && !event.target.contains(root)) return
+        if (frame !== null) return
+        frame = requestAnimationFrame(() => {
+          frame = null
+          measure()
+        })
+      }
+      const observer = new ResizeObserver(() => queueMeasure())
+      observer.observe(root)
+      if (editorRoot) observer.observe(editorRoot)
+      measure()
+      window.addEventListener("scroll", queueMeasure, { capture: true, passive: true })
+      window.addEventListener("resize", queueMeasure, { passive: true })
       return () => {
-        container.removeEventListener("scroll", onScroll)
-        window.removeEventListener("resize", onScroll)
+        window.removeEventListener("scroll", queueMeasure, true)
+        window.removeEventListener("resize", queueMeasure)
+        observer.disconnect()
+        if (frame !== null) cancelAnimationFrame(frame)
       }
     },
   )
@@ -1182,13 +1172,6 @@ export const Editor = (props: EditorProps) => {
     if (shouldResume) startPlayback(audio)
   }
 
-  const sel = createMemo(() => {
-    const activeNote = selectedNote()
-    return selectedNotes().length === 1 && activeNote
-      ? phrases()[activeNote.phraseIdx]?.notes[activeNote.noteIdx]
-      : null
-  })
-
   const selectedPitchEvidence = createMemo(() => {
     const activeNote = selectedNote()
     if (!activeNote) return undefined
@@ -1256,6 +1239,7 @@ export const Editor = (props: EditorProps) => {
 
   return (
     <div
+      ref={(element) => { editorRoot = element }}
       class={`${isExpanded() ? "fixed inset-0 z-[80] h-dvh w-screen overflow-y-auto bg-zinc-950 p-4" : "max-w-7xl mx-auto"} space-y-6`}
     >
       <EditorHeader
@@ -1457,6 +1441,8 @@ export const Editor = (props: EditorProps) => {
             displayTime={displayTime()}
             beatToTime={audioBeatToTime}
             pixelsPerBeat={pixelsPerBeat()}
+            visibleLeft={canvasLeft()}
+            visibleWidth={viewportWidth() + 2 * PIANO_ROLL_OVERSCAN}
             timelineRef={timelineRef}
             onTimelineClick={handleTimelineClick}
             onMouseDown={handleTimelineMouseDown}

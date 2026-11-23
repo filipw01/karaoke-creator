@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, onCleanup, Show, untrack } from "solid-js"
+import { createEffect, createMemo, createSignal, onCleanup, Show } from "solid-js"
 import { Portal } from "@solidjs/web"
 import {
   getResult,
@@ -62,30 +62,23 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
       end_locked: false,
     }))
   })
-  const initialRevision = untrack(draftRevision)
-  const [lyricsDraft, setLyricsDraft] = createSignal(initialRevision?.raw_text ?? "")
-  const [savedLyricsDraft, setSavedLyricsDraft] = createSignal(initialRevision?.raw_text ?? "")
-  const [draftRevisionId, setDraftRevisionId] = createSignal(initialRevision?.id ?? "")
+  const draftRevisionId = () => draftRevision()?.id
+  const [draft, setDraft] = createSignal<{ jobId: string; revisionId: string | undefined; text: string } | null>(null)
+  const savedLyrics = createMemo(() => draftRevision()?.raw_text ?? "")
+  const lyricsDraft = createMemo(() => {
+    const edit = draft()
+    return edit && edit.jobId === jobId() && edit.revisionId === draftRevisionId() ? edit.text : savedLyrics()
+  })
   const [busyToken, setBusyToken] = createSignal<string | null>(null)
   const [savingLyrics, setSavingLyrics] = createSignal(false)
   const [realigning, setRealigning] = createSignal(false)
   const [alignmentBackend, setAlignmentBackend] = createSignal<AlignmentBackend>("sofa")
   const [error, setError] = createSignal<string | null>(null)
 
-  createEffect(
-    () => [jobId(), draftRevision()?.id ?? "", draftRevision()?.raw_text ?? ""] as const,
-    ([job, revision, text], previous) => {
-      if (previous?.[0] === job && previous[1] === revision && previous[2] === text) return
-      setLyricsDraft(text)
-      setSavedLyricsDraft(text)
-      setDraftRevisionId(revision)
-    },
-  )
-
   const alignmentByToken = createMemo(() => new Map(alignments().map((alignment) => [alignment.token_id, alignment])))
   const flaggedTokens = createMemo(() => tokens().filter((token) => alignmentByToken().get(token.id)?.status !== "aligned"))
   const lockedAlignments = createMemo(() => alignments().filter((alignment) => alignment.start_locked || alignment.end_locked))
-  const lyricsDirty = createMemo(() => lyricsDraft() !== savedLyricsDraft())
+  const lyricsDirty = createMemo(() => lyricsDraft() !== savedLyrics())
   const alignmentIsCurrent = createMemo(() => draftRevision()?.id === revision()?.id)
 
   createEffect(lyricsDirty, (dirty) => {
@@ -129,7 +122,8 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
   }
 
   const saveRevision = async () => {
-    if (!lyricsDraft().trim()) {
+    const submitted = lyricsDraft()
+    if (!submitted.trim()) {
       setError("Lyrics cannot be empty.")
       return
     }
@@ -138,12 +132,18 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
     setError(null)
     try {
       const language: LyricLanguage = revision()?.language === "pl" ? "pl" : "en"
-      const saved = await saveLyricRevision(id, lyricsDraft(), language)
+      const saved = await saveLyricRevision(id, submitted, language)
       if (!isCurrentJob(id)) return
-      setDraftRevisionId(saved.id)
-      setLyricsDraft(saved.raw_text)
-      setSavedLyricsDraft(saved.raw_text)
-      await refreshResult(id)
+      const latestText = lyricsDraft()
+      const current = result()
+      setDraft(latestText === submitted ? null : { jobId: id, revisionId: saved.id, text: latestText })
+      props.onResultChange({
+        ...current,
+        lyric_revisions: [...(current.lyric_revisions ?? (current.lyric_revision ? [current.lyric_revision] : [])), saved],
+        selected_lyric_revision_id: saved.id,
+        pending_revision_id: saved.id,
+        export_ready: false,
+      })
     } catch (err) {
       if (isCurrentJob(id)) setError(err instanceof Error ? err.message : "Failed to save lyric revision")
     } finally {
@@ -152,7 +152,8 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
   }
 
   const realign = async () => {
-    if (!draftRevisionId()) return
+    const revisionId = draftRevisionId()
+    if (!revisionId) return
     if (lyricsDirty()) {
       setError("Save the lyric revision before re-aligning it.")
       return
@@ -161,35 +162,39 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
     setRealigning(true)
     setError(null)
     try {
-      const started = await startAlignmentRun(id, draftRevisionId(), [], alignmentBackend())
+      const started = await startAlignmentRun(id, revisionId, [], alignmentBackend())
       let transientFailures = 0
       for (let attempt = 0; attempt < 900; attempt += 1) {
         await sleep(1000)
         if (!isCurrentJob(id)) return
+        let status: Awaited<ReturnType<typeof getStatus>>
+        let next: JobResult | undefined
         try {
-          const status = await getStatus(id)
+          status = await getStatus(id)
           if (!isCurrentJob(id)) return
-          transientFailures = 0
-          const matchingRun = status.alignment_run?.id === started.alignment_run_id
-          if (matchingRun && status.status === "done") {
-            const next = await getResult(id)
-            if (!isCurrentJob(id)) return
-            if (next.alignment_run?.id !== started.alignment_run_id) {
-              throw new Error("Alignment completed but the returned result belongs to another run")
-            }
-            props.onResultChange(next)
-            break
-          }
-          if (matchingRun && status.status === "error") {
-            throw new Error(status.error ?? status.message ?? "Alignment failed")
+          if (status.alignment_run?.id === started.alignment_run_id
+            && status.status === "done" && status.alignment_run.status !== "failed") {
+            next = await getResult(id)
           }
         } catch (err) {
-          if (err instanceof Error && (err.message.includes("completed but") || err.message.includes("Alignment failed"))) throw err
-          transientFailures += 1
-          if (transientFailures >= 5) throw err
+          if (++transientFailures >= 5) throw err
+          continue
         }
-        if (attempt === 899) throw new Error("Alignment timed out")
+        if (!isCurrentJob(id)) return
+        transientFailures = 0
+        if (status.alignment_run?.id !== started.alignment_run_id) continue
+        if (status.status === "error" || status.alignment_run.status === "failed") {
+          throw new Error(status.error || status.message || "Alignment failed")
+        }
+        if (next) {
+          if (next.alignment_run?.id !== started.alignment_run_id) {
+            throw new Error("Alignment completed but the returned result belongs to another run")
+          }
+          props.onResultChange(next)
+          return
+        }
       }
+      throw new Error("Alignment timed out")
     } catch (err) {
       if (isCurrentJob(id)) setError(err instanceof Error ? err.message : "Failed to re-align lyrics")
     } finally {
@@ -278,7 +283,9 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
         <textarea
           id="canonical-lyrics"
           value={lyricsDraft()}
-          onInput={(event) => setLyricsDraft(event.currentTarget.value)}
+          onInput={(event) => setDraft({
+            jobId: jobId(), revisionId: draftRevisionId(), text: event.currentTarget.value,
+          })}
           rows={5}
           class="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white font-mono leading-relaxed focus:outline-none focus:border-violet-500"
         />

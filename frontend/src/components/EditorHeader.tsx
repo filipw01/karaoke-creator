@@ -1,4 +1,4 @@
-import { createMemo } from "solid-js"
+import { createMemo, For } from "solid-js"
 import type { JobResult } from "../types"
 
 interface EditorHeaderProps {
@@ -18,7 +18,8 @@ interface EditorHeaderProps {
 
 export const EditorHeader = (props: EditorHeaderProps) => {
   const comparison = createMemo(() => props.result.alignment_comparison)
-  const modes = createMemo(() => ["sofa", "legacy"].filter((mode) => props.result.alignment_results?.[mode]) as Array<"sofa" | "legacy">)
+  const alignments = createMemo(() => props.result.alignment_results)
+  const modes = createMemo(() => (["sofa", "legacy"] as const).filter((mode) => alignments()?.[mode]))
   const currentMode = createMemo(() => props.result.current_alignment_mode === "canonical" && props.result.alignment_results?.sofa
     ? "sofa"
     : props.result.current_alignment_mode ?? "canonical")
@@ -36,20 +37,22 @@ export const EditorHeader = (props: EditorHeaderProps) => {
         {modes().length > 0 && (
           <div class="mt-3 flex items-center gap-2 flex-wrap">
             <span class="text-xs text-zinc-500">Alignment:</span>
-            {modes().map((mode) => (
-              <button
-                type="button"
-                onClick={() => props.onModeChange(mode)}
-                disabled={props.switchingMode !== null}
-                class={`px-2.5 py-1 rounded-md text-xs transition-colors ${
-                  currentMode() === mode
-                    ? "bg-violet-600 text-white"
-                    : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
-                } disabled:opacity-50`}
-              >
-                {props.switchingMode === mode ? "Switching…" : mode.toUpperCase()}
-              </button>
-            ))}
+            <For each={modes()}>
+              {(mode) => (
+                <button
+                  type="button"
+                  onClick={() => props.onModeChange(mode)}
+                  disabled={props.switchingMode !== null}
+                  class={`px-2.5 py-1 rounded-md text-xs transition-colors ${
+                    currentMode() === mode
+                      ? "bg-violet-600 text-white"
+                      : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+                  } disabled:opacity-50`}
+                >
+                  {props.switchingMode === mode ? "Switching…" : mode.toUpperCase()}
+                </button>
+              )}
+            </For>
             {comparison()?.status === "running" && (
               <span class="text-xs text-amber-300">Legacy processing in background…</span>
             )}

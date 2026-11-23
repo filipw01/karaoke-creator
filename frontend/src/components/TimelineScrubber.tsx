@@ -1,24 +1,30 @@
-import { createMemo } from "solid-js"
+import { createMemo, For } from "solid-js"
 
 const TimelineScrubberGrid = (props: {
   totalBeats: number
   beatToTime: (beat: number) => number
   pixelsPerBeat: number
+  visibleLeft: number
+  visibleWidth: number
 }) => {
-  const measures = createMemo(() => Array.from(
-    { length: Math.floor(props.totalBeats / 16) + 1 },
-    (_, index) => index * 16,
-  ))
-  const timeLabels = createMemo(() => {
-    let previousLabel: string | null = null
-    return measures().flatMap((beat) => {
-      const time = props.beatToTime(beat)
-      if (time < 0) return []
-      const label = `${Math.floor(time / 60)}:${Math.floor(time % 60).toString().padStart(2, "0")}`
-      if (label === previousLabel) return []
-      previousLabel = label
-      return [{ beat, label }]
-    })
+  const labelForMeasure = (measure: number): string => {
+    const seconds = Math.floor(props.beatToTime(measure * 16))
+    return `${Math.floor(seconds / 60)}:${(seconds % 60).toString().padStart(2, "0")}`
+  }
+  const visibleMeasures = createMemo(() => {
+    const measureWidth = 16 * props.pixelsPerBeat
+    const start = Math.max(0, Math.floor(props.visibleLeft / measureWidth))
+    const end = Math.min(
+      Math.floor(props.totalBeats / 16),
+      Math.ceil((props.visibleLeft + props.visibleWidth) / measureWidth),
+    )
+    const measures: number[] = []
+    for (let measure = start; measure <= end; measure++) {
+      if (measure === 0 || labelForMeasure(measure) !== labelForMeasure(measure - 1)) {
+        measures.push(measure)
+      }
+    }
+    return measures
   })
   return (
     <div
@@ -34,14 +40,16 @@ const TimelineScrubberGrid = (props: {
         "background-repeat": "repeat",
       }}
     >
-      {timeLabels().map(({ beat, label }) => (
-        <span
-          class="absolute top-1 left-1 text-[10px] text-zinc-500 tabular-nums"
-          style={{ left: `${beat * props.pixelsPerBeat}px` }}
-        >
-          {label}
-        </span>
-      ))}
+      <For each={visibleMeasures()}>
+        {(measure) => (
+          <span
+            class="absolute top-1 left-1 text-[10px] text-zinc-500 tabular-nums"
+            style={{ left: `${measure * 16 * props.pixelsPerBeat}px` }}
+          >
+            {labelForMeasure(measure)}
+          </span>
+        )}
+      </For>
     </div>
   )
 }
@@ -93,6 +101,8 @@ interface TimelineScrubberProps {
   displayTime: number
   beatToTime: (beat: number) => number
   pixelsPerBeat: number
+  visibleLeft: number
+  visibleWidth: number
   timelineRef: { current: HTMLDivElement | null }
   onTrackReady?: (node: HTMLDivElement | null) => void
   onTimelineClick: (e: MouseEvent & { currentTarget: HTMLDivElement }) => void
@@ -115,7 +125,13 @@ export const TimelineScrubber = (props: TimelineScrubberProps) => {
         onMouseUp={props.onMouseUp}
         onSeekKeyDown={props.onSeekKeyDown}
       >
-        <TimelineScrubberGrid totalBeats={props.totalBeats} beatToTime={props.beatToTime} pixelsPerBeat={props.pixelsPerBeat} />
+        <TimelineScrubberGrid
+          totalBeats={props.totalBeats}
+          beatToTime={props.beatToTime}
+          pixelsPerBeat={props.pixelsPerBeat}
+          visibleLeft={props.visibleLeft}
+          visibleWidth={props.visibleWidth}
+        />
         <div
           class="pointer-events-none absolute bottom-0 left-0 top-0 z-10 w-0.5 bg-pink-500"
           style={{

@@ -20,7 +20,7 @@ import { EditorPage } from "./pages/EditorPage"
 import { ExportPage } from "./pages/ExportPage"
 import { LyricsPage } from "./pages/LyricsPage"
 import { ProcessingPage } from "./pages/ProcessingPage"
-import { enqueueSong, refreshSongs, setLibraryDirectory, songQueue, startExistingSong, startSongQueue } from "./songQueue"
+import { refreshSongs, setLibraryDirectory, songQueue, startSongQueue } from "./songQueue"
 
 const WORKFLOW_STEPS: Array<{ key: AppStep; label: string }> = [
   { key: "upload", label: "Upload" },
@@ -56,7 +56,7 @@ const UploadFlow = () => {
 
   const handleUploaded = (id: string) => {
     setError("")
-    void enqueueSong(id)
+    void refreshSongs()
     navigate(`/processing/${id}`)
   }
 
@@ -196,9 +196,6 @@ const AppShell = (props: { children: JSX.Element }) => {
     if (status === "done") {
       navigate(`/editor/${id}`)
       return
-    }
-    if (status === "pending") {
-      await startExistingSong(id)
     }
     navigate(`/processing/${id}`)
   }

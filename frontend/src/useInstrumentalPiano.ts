@@ -90,10 +90,26 @@ export const useInstrumentalPiano = ({
     pianoResumeRef.current = null
   })
 
+  const chartNotes = createMemo<Phrase[]>((previous) => {
+    const next = phrases()
+    const sameSchedule = previous?.length === next.length && next.every((phrase, index) => {
+      const old = previous[index]
+      return phrase === old || (phrase.notes.length === old.notes.length && phrase.notes.every((note, noteIndex) => {
+        const oldNote = old.notes[noteIndex]
+        return note === oldNote || (
+          note.start_beat === oldNote.start_beat
+          && note.duration_beats === oldNote.duration_beats
+          && note.pitch === oldNote.pitch
+        )
+      }))
+    })
+    return sameSchedule ? previous : next
+  })
+
   const scheduledNotes = createMemo(() => {
     const secondsPerBeat = 60 / (ustar_bpm() * 4)
     const gap = gap_s()
-    return phrases().flatMap((phrase) => phrase.notes.map((note) => ({
+    return chartNotes().flatMap((phrase) => phrase.notes.map((note) => ({
       start: gap + note.start_beat * secondsPerBeat,
       duration: note.duration_beats * secondsPerBeat,
       midi: note.pitch + 60,
