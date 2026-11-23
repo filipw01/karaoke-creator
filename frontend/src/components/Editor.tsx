@@ -1,7 +1,8 @@
 import { createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
+import { useBeforeLeave } from "@solidjs/router"
 import type { JobResult, Phrase, UltraStarNote } from "../types"
 import { switchAlignmentMode, updateNotes } from "../api"
-import { isPianoTrack, playPianoNote, playTestPiano, useInstrumentalPiano, type PianoResumeRef } from "../useInstrumentalPiano"
+import { isPianoTrack, useInstrumentalPiano } from "../useInstrumentalPiano"
 import type { AudioTrack } from "./AudioControls"
 import { AudioControls } from "./AudioControls"
 import { EditorHeader } from "./EditorHeader"
@@ -141,7 +142,7 @@ export const Editor = (props: EditorProps) => {
   const [saveError, setSaveError] = createSignal("")
   const [switchingMode, setSwitchingMode] = createSignal<string | null>(null)
   const [alignmentDirty, setAlignmentDirty] = createSignal(false)
-  const [exportWarning, setExportWarning] = createSignal(false)
+  const [blockedAction, setBlockedAction] = createSignal<"export" | "mode" | null>(null)
   const [loadedAudioDuration, setLoadedAudioDuration] = createSignal(0)
   const audioDuration = createMemo(() => loadedAudioDuration() || result().audio_duration || 0)
   const [isDraggingTimeline, setIsDraggingTimeline] = createSignal(false)
@@ -154,7 +155,8 @@ export const Editor = (props: EditorProps) => {
   const [isExpanded, setIsExpanded] = createSignal(false)
   const pendingSeekTimeRef: { current: number | null } = { current: null }
   const timelineRef: { current: HTMLDivElement | null } = { current: null }
-  const suppressTimelineClickRef = { current: false }
+  let timelineDragActive = false
+  let suppressTimelineClick = false
   let lastWheelZoom = -Infinity
   let wheelZoomFrame: number | null = null
   let wheelZoomScale: number | null = null
@@ -167,7 +169,6 @@ export const Editor = (props: EditorProps) => {
   const audioRef: { current: HTMLAudioElement | null } = { current: null }
   let playRequestId = 0
   let audioJobId: string | null = null
-  const pianoResumeRef: { current: PianoResumeRef | null } = { current: null }
   const canvasRef: { current: HTMLDivElement | null } = { current: null }
   const [pianoRollCanvas, setPianoRollCanvas] = createSignal<HTMLCanvasElement | null>(null)
   const [viewportWidth, setViewportWidth] = createSignal(0)
@@ -229,7 +230,7 @@ export const Editor = (props: EditorProps) => {
   ))
   const desiredCanvasWidth = createMemo(() => Math.max(1, Math.ceil(totalBeats() * pixelsPerBeat())))
 
-  useInstrumentalPiano({
+  const piano = useInstrumentalPiano({
     audioRef,
     audioTrack,
     isPlaying,
@@ -237,7 +238,6 @@ export const Editor = (props: EditorProps) => {
     gap_s,
     ustar_bpm,
     playbackRate,
-    pianoResumeRef,
   })
 
   const playbackPosition = (): number => {
@@ -371,6 +371,7 @@ export const Editor = (props: EditorProps) => {
   }
 
   const applyEditHistory = (direction: "undo" | "redo"): void => {
+    if (switchingMode()) return
     const source = direction === "undo" ? undoHistoryRef.current : redoHistoryRef.current
     const destination = direction === "undo" ? redoHistoryRef.current : undoHistoryRef.current
     const previous = source.pop()
@@ -392,13 +393,23 @@ export const Editor = (props: EditorProps) => {
     audioRef.current?.pause()
   })
 
-  createEffect(jobId, (current, previous) => {
-    if (previous === undefined || previous === current) return
+  const resetChartHistory = (saved: Phrase[]) => {
     cancelNoteDragFrame()
     noteDragRef.current = null
+    selectionDragRef.current = null
+    setSelectionRect(null)
+    setCanvasCursor("default")
+    updateSelection([])
     undoHistoryRef.current = []
     redoHistoryRef.current = []
-    setSavedPhrases(phrases())
+    setSavedPhrases(saved)
+  }
+
+  createEffect(jobId, (current, previous) => {
+    if (previous === undefined || previous === current) return
+    resetChartHistory(phrases())
+    setSwitchingMode(null)
+    setBlockedAction(null)
     setSaving(false)
     setSaveError("")
   })
@@ -461,6 +472,7 @@ export const Editor = (props: EditorProps) => {
   }
 
   const nudgeSelectedNotes = (key: string): boolean => {
+    if (switchingMode()) return false
     const primarySelection = selectedNote()
     const selection = selectedNotes().length > 0
       ? selectedNotes()
@@ -517,43 +529,41 @@ export const Editor = (props: EditorProps) => {
     setDragTime(null)
   }
 
-  const finishTimelineSeek = (suppressClick: boolean): void => {
-    const draggingTime = dragTime()
-    if (draggingTime !== null) {
-      seekAudioTo(draggingTime)
-      suppressTimelineClickRef.current = suppressClick
-    }
-    setIsDraggingTimeline(false)
-  }
-
-  const handleTimelineClick = (e: MouseEvent & { currentTarget: HTMLDivElement }) => {
-    if (suppressTimelineClickRef.current) {
-      suppressTimelineClickRef.current = false
+  const handleTimelineClick = (event: MouseEvent) => {
+    if (suppressTimelineClick) {
+      suppressTimelineClick = false
       return
     }
-    if (!isDraggingTimeline()) {
-      updateTimeFromMouse(e.clientX, false)
-    }
+    if (!timelineDragActive) updateTimeFromMouse(event.clientX, false)
   }
 
-  const handleTimelineMouseDown = (e: MouseEvent & { currentTarget: HTMLDivElement }) => {
-    if (e.button !== 0) return // Only left mouse button
+  const handleTimelineMouseDown = (event: MouseEvent) => {
+    if (event.button !== 0) return
+    timelineDragActive = true
+    suppressTimelineClick = false
     setIsDraggingTimeline(true)
-    setDragTime(null)
-    updateTimeFromMouse(e.clientX, true)
+    updateTimeFromMouse(event.clientX, true)
   }
 
-  const handleTimelineMouseUp = () => {
-    finishTimelineSeek(true)
-  }
-
-  createEffect(isDraggingTimeline, (dragging) => {
-    if (!dragging) return
-    const onMouseUp = () => finishTimelineSeek(false)
-    const onMouseMove = (event: MouseEvent) => {
+  createEffect(() => true, () => {
+    const cancelDragFrame = () => {
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
+    }
+    const onMouseUp = (event: MouseEvent) => {
+      if (!timelineDragActive || event.button !== 0) return
+      timelineDragActive = false
+      suppressTimelineClick = event.target instanceof Node && Boolean(timelineRef.current?.contains(event.target))
+      cancelDragFrame()
+      updateTimeFromMouse(event.clientX, false)
+      setDragTime(null)
+      setIsDraggingTimeline(false)
+    }
+    const onMouseMove = (event: MouseEvent) => {
+      if (!timelineDragActive) return
+      cancelDragFrame()
       rafRef.current = requestAnimationFrame(() => {
-        if (isDraggingTimeline()) updateTimeFromMouse(event.clientX, true)
+        if (timelineDragActive) updateTimeFromMouse(event.clientX, true)
         rafRef.current = null
       })
     }
@@ -562,8 +572,7 @@ export const Editor = (props: EditorProps) => {
     return () => {
       window.removeEventListener("mouseup", onMouseUp)
       window.removeEventListener("mousemove", onMouseMove)
-      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current)
-      rafRef.current = null
+      cancelDragFrame()
     }
   })
 
@@ -757,43 +766,30 @@ export const Editor = (props: EditorProps) => {
     drawPianoRoll,
   )
 
-  const findNoteAtPoint = (clientX: number, clientY: number): { phraseIdx: number; noteIdx: number } | null => {
-    const root = canvasRef.current
-    if (!root) return null
-    const rect = root.getBoundingClientRect()
-    const y = clientY - rect.top
-    const clickedBeat = (clientX - rect.left) / pixelsPerBeat() - gapBeats()
-    const clickedPitch = maxPitch() - Math.floor(y / ROW_HEIGHT)
+  const findNoteAtPoint = (x: number, y: number) => {
+    const scale = pixelsPerBeat()
+    const beat = x / scale - gapBeats()
+    const pitch = maxPitch() - Math.floor(y / ROW_HEIGHT)
 
-    for (let pIdx = 0; pIdx < phrases().length; pIdx++) {
-      const phrase = phrases()[pIdx]
-      for (let nIdx = 0; nIdx < phrase.notes.length; nIdx++) {
-        const note = phrase.notes[nIdx]
-        if (
-          clickedBeat >= note.start_beat &&
-          clickedBeat <= note.start_beat + note.duration_beats &&
-          clickedPitch === note.pitch
-        ) {
-          return { phraseIdx: pIdx, noteIdx: nIdx }
-        }
+    for (const [phraseIdx, phrase] of phrases().entries()) {
+      const bounds = getPhraseStats(phrase)
+      if (beat < bounds.start || beat > bounds.end || pitch < bounds.minPitch || pitch > bounds.maxPitch) continue
+      for (const [noteIdx, note] of phrase.notes.entries()) {
+        if (note.pitch !== pitch) continue
+        const offset = beat - note.start_beat
+        if (offset < 0 || offset > note.duration_beats) continue
+        const edge = 6 / scale
+        const mode: NoteDragMode = offset <= edge ? "start" : offset >= note.duration_beats - edge ? "end" : "move"
+        return { phraseIdx, noteIdx, note, mode }
       }
     }
     return null
   }
 
   const cursorForPoint = (clientX: number, clientY: number): CanvasCursor => {
-    const hit = findNoteAtPoint(clientX, clientY)
-    if (!hit) return "default"
-    const note = phrases()[hit.phraseIdx]?.notes[hit.noteIdx]
-    const root = canvasRef.current
-    if (!note || !root) return "default"
-    const rect = root.getBoundingClientRect()
-    const pointerBeat = (clientX - rect.left) / pixelsPerBeat() - gapBeats()
-    const offset = pointerBeat - note.start_beat
-    const edgeThreshold = 6 / pixelsPerBeat()
-    return offset <= edgeThreshold || offset >= note.duration_beats - edgeThreshold
-      ? "ew-resize"
-      : "grab"
+    const rect = canvasRef.current?.getBoundingClientRect()
+    const hit = rect && findNoteAtPoint(clientX - rect.left, clientY - rect.top)
+    return !hit ? "default" : hit.mode === "move" ? "grab" : "ew-resize"
   }
 
   const updateSelection = (next: NoteSelection[], primary: NoteSelection | null = null): void => {
@@ -828,10 +824,12 @@ export const Editor = (props: EditorProps) => {
   }
 
   const handleCanvasPointerDown = (event: PointerEvent & { currentTarget: HTMLCanvasElement }) => {
-    if (event.button !== 0) return
-    const hit = findNoteAtPoint(event.clientX, event.clientY)
-    const root = canvasRef.current
-    if (!root) return
+    if (event.button !== 0 || switchingMode()) return
+    const rect = canvasRef.current?.getBoundingClientRect()
+    if (!rect) return
+    const point = { x: event.clientX - rect.left, y: event.clientY - rect.top }
+    const match = findNoteAtPoint(point.x, point.y)
+    const hit = match && { phraseIdx: match.phraseIdx, noteIdx: match.noteIdx }
 
     if (event.shiftKey && hit) {
       const isSelected = selectedNotes().some((selection) => noteSelectionKey(selection) === noteSelectionKey(hit))
@@ -843,14 +841,12 @@ export const Editor = (props: EditorProps) => {
         : isSelected
           ? selectedNote()
           : hit)
-      setCanvasCursor(cursorForPoint(event.clientX, event.clientY))
+      setCanvasCursor(match.mode === "move" ? "grab" : "ew-resize")
       event.preventDefault()
       return
     }
 
     if (!hit) {
-      const rect = root.getBoundingClientRect()
-      const point = { x: event.clientX - rect.left, y: event.clientY - rect.top }
       const marquee: SelectionRect = {
         startX: point.x,
         startY: point.y,
@@ -866,13 +862,7 @@ export const Editor = (props: EditorProps) => {
       event.preventDefault()
       return
     }
-    const note = phrases()[hit.phraseIdx]?.notes[hit.noteIdx]
-    if (!note) return
-    const rect = root.getBoundingClientRect()
-    const pointerBeat = (event.clientX - rect.left) / pixelsPerBeat() - gapBeats()
-    const offset = pointerBeat - note.start_beat
-    const edgeThreshold = 6 / pixelsPerBeat()
-    const mode: NoteDragMode = offset <= edgeThreshold ? "start" : offset >= note.duration_beats - edgeThreshold ? "end" : "move"
+    const { note, mode } = match
     const isSelected = selectedNotes().some((selection) => noteSelectionKey(selection) === noteSelectionKey(hit))
     const dragSelection = isSelected ? selectedNotes() : [hit]
     updateSelection(dragSelection, hit)
@@ -954,7 +944,7 @@ export const Editor = (props: EditorProps) => {
   const applyNoteDrag = ({ clientX, clientY }: PointerPosition) => {
     const drag = noteDragRef.current
     const root = canvasRef.current
-    if (!drag || !root) return
+    if (!drag || !root || switchingMode()) return
     const rect = root.getBoundingClientRect()
     const scaleY = (pitchRange() * ROW_HEIGHT) / rect.height
     const beatDelta = Math.round((clientX - drag.startX) / pixelsPerBeat())
@@ -1095,6 +1085,7 @@ export const Editor = (props: EditorProps) => {
   )
 
   const updateNote = (field: keyof UltraStarNote, value: string | number) => {
+    if (switchingMode()) return
     const activeNote = selectedNote()
     if (!activeNote) return
     const previous = phrases()
@@ -1105,7 +1096,7 @@ export const Editor = (props: EditorProps) => {
   }
 
   const handleSave = async () => {
-    if (!isDirty() || saving()) return
+    if (!isDirty() || saving() || switchingMode()) return
     if (props.confirmSaveMessage && !window.confirm(props.confirmSaveMessage)) return
     const id = jobId()
     const submitted = phrases()
@@ -1129,7 +1120,7 @@ export const Editor = (props: EditorProps) => {
   }
 
   const startPlayback = (audio: HTMLAudioElement) => {
-    if (isPianoTrack(audioTrack())) pianoResumeRef.current?.resume()
+    if (isPianoTrack(audioTrack())) piano.resume()
     const requestId = ++playRequestId
     setPlayRequested(true)
     void audio.play().catch(() => {
@@ -1209,27 +1200,54 @@ export const Editor = (props: EditorProps) => {
   const handleAudioTrackChange = (track: AudioTrack) => {
     if (track === audioTrack()) return
     if (isPianoTrack(track) && audioRef.current && !audioRef.current.paused) {
-      pianoResumeRef.current?.resume()
+      piano.resume()
     }
     setAudioTrack(track)
   }
 
-  const guardedExport = () => {
-    if (alignmentDirty() || result().export_ready === false) {
-      setExportWarning(true)
-      return
+  const actionWarning = createMemo(() => {
+    const action = blockedAction()
+    if (!action) return ""
+    if (saving()) return "Wait for the note save to finish."
+    if (isDirty()) return action === "export"
+      ? "Save note changes before exporting."
+      : "Save note changes before switching alignment modes."
+    if (action === "mode") return ""
+    if (switchingMode()) return "Wait for the alignment mode to finish switching."
+    if (alignmentDirty()) return "Save boundary or lyric revision changes before exporting."
+    return result().export_ready === false ? "Re-align the selected lyric revision before exporting." : ""
+  })
+
+  const canExport = () => {
+    if (isDirty() || saving() || switchingMode() || alignmentDirty() || result().export_ready === false) {
+      setBlockedAction("export")
+      return false
     }
-    setExportWarning(false)
-    onExport()
+    setBlockedAction(null)
+    return true
   }
 
+  useBeforeLeave(({ to, preventDefault }) => {
+    if (typeof to === "string" && to.split(/[?#]/, 1)[0] === `/export/${jobId()}` && !canExport()) {
+      preventDefault()
+    }
+  })
+
   const handleModeChange = async (mode: "sofa" | "legacy" | "canonical") => {
-    if (mode === (result().current_alignment_mode ?? "canonical")) return
+    if (switchingMode() || mode === (result().current_alignment_mode ?? "canonical")) return
+    if (isDirty() || saving()) {
+      setBlockedAction("mode")
+      return
+    }
     const id = jobId()
+    setBlockedAction(null)
     setSwitchingMode(mode)
     try {
       const next = await switchAlignmentMode(id, mode)
-      if (!disposed && jobId() === id) onResultChange(next)
+      if (!disposed && jobId() === id) {
+        resetChartHistory(next.phrases)
+        onResultChange(next)
+      }
     } catch (error) {
       console.error("Failed to switch alignment mode", error)
     } finally {
@@ -1249,7 +1267,7 @@ export const Editor = (props: EditorProps) => {
         saving={saving()}
         isDirty={isDirty()}
         onSave={handleSave}
-        onExport={guardedExport}
+        onExport={() => { if (canExport()) onExport() }}
         onOpenLyricsAlignment={() => setLyricsAlignmentOpen(true)}
         onModeChange={handleModeChange}
         switchingMode={switchingMode()}
@@ -1262,11 +1280,9 @@ export const Editor = (props: EditorProps) => {
           {saveError()}
         </p>
       )}
-      {exportWarning() && (
+      {actionWarning() && (
         <p class="text-sm text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2" role="alert">
-          {alignmentDirty()
-            ? "Save boundary or lyric revision changes before exporting."
-            : "Re-align the selected lyric revision before exporting."}
+          {actionWarning()}
         </p>
       )}
       {showAdvancedActions && (
@@ -1291,19 +1307,7 @@ export const Editor = (props: EditorProps) => {
         audioSourceUrls={props.audioSourceUrls}
         availableTracks={props.availableAudioTracks}
         showTrackSelection={props.audioSourceUrl === undefined || props.audioSourceUrls !== undefined}
-        onTestSound={() => {
-          const ctx = pianoResumeRef.current?.getContext()
-          if (ctx) {
-            ctx.resume().then(() => {
-              const now = ctx.currentTime
-              ;[60, 64, 67, 64].forEach((midi, i) => {
-                playPianoNote(ctx, ctx.destination, midi, 0.28, 0.7, now + i * 0.28)
-              })
-            }).catch(() => {})
-          } else {
-            playTestPiano()
-          }
-        }}
+        onTestSound={piano.testSound}
         onSourceChange={loadAudioSource}
         onPlaying={() => {
           if (audioRef.current?.paused !== false) return
@@ -1446,7 +1450,6 @@ export const Editor = (props: EditorProps) => {
             timelineRef={timelineRef}
             onTimelineClick={handleTimelineClick}
             onMouseDown={handleTimelineMouseDown}
-            onMouseUp={handleTimelineMouseUp}
             onSeekKeyDown={handleSeekKeyDown}
           />
           <div

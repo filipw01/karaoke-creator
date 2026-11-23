@@ -9,7 +9,7 @@ export const isPianoTrack = (track: AudioTrack): boolean =>
   track === "instrumental_with_playback" || track === "vocals_with_playback"
 
 /** Play a single piano-like note via Web Audio API. Optional startTime (in context time) to schedule ahead. */
-export const playPianoNote = (
+const playPianoNote = (
   ctx: AudioContext,
   destination: AudioNode,
   midiPitch: number,
@@ -33,24 +33,6 @@ export const playPianoNote = (
   osc.stop(now + durationSec)
 }
 
-/** Create an AudioContext, resume it, and play a short test phrase. Call from a user gesture (e.g. button click). */
-export const playTestPiano = (): void => {
-  const ctx = new AudioContext()
-  ctx.resume().then(() => {
-    const now = ctx.currentTime
-    const notes = [60, 64, 67, 64]
-    notes.forEach((midi, i) => {
-      playPianoNote(ctx, ctx.destination, midi, 0.28, 0.7, now + i * 0.28)
-    })
-  }).catch(() => {})
-}
-
-export interface PianoResumeRef {
-  resume: () => void
-  /** Use this context for test sound when on piano/instrumental to verify playback context works. */
-  getContext: () => AudioContext | null
-}
-
 interface UseInstrumentalPianoArgs {
   audioRef: { current: HTMLAudioElement | null }
   audioTrack: Accessor<AudioTrack>
@@ -59,8 +41,6 @@ interface UseInstrumentalPianoArgs {
   gap_s: Accessor<number>
   ustar_bpm: Accessor<number>
   playbackRate: Accessor<number>
-  /** Set by hook so Editor can call resume() on play click (same user gesture). */
-  pianoResumeRef: { current: PianoResumeRef | null }
 }
 
 /**
@@ -75,19 +55,29 @@ export const useInstrumentalPiano = ({
   gap_s,
   ustar_bpm,
   playbackRate,
-  pianoResumeRef,
-}: UseInstrumentalPianoArgs): void => {
+}: UseInstrumentalPianoArgs) => {
   let ctx: AudioContext | null = null
-  pianoResumeRef.current = {
-    resume: () => {
-      ctx ??= new AudioContext()
-      void ctx.resume().catch(() => {})
-    },
-    getContext: () => ctx,
+  const getContext = () => (ctx ??= new AudioContext())
+
+  const resume = () => {
+    void getContext().resume().catch(() => {})
   }
+
+  const testSound = () => {
+    const context = getContext()
+    void context.resume().then(() => {
+      if (ctx !== context) return
+      const now = context.currentTime
+      const notes = [60, 64, 67, 64]
+      notes.forEach((midi, index) => {
+        playPianoNote(context, context.destination, midi, 0.28, 0.7, now + index * 0.28)
+      })
+    }).catch(() => {})
+  }
+
   onCleanup(() => {
     if (ctx) void ctx.close().catch(() => {})
-    pianoResumeRef.current = null
+    ctx = null
   })
 
   const chartNotes = createMemo<Phrase[]>((previous) => {
@@ -169,4 +159,6 @@ export const useInstrumentalPiano = ({
       }
     },
   )
+
+  return { resume, testSound }
 }
