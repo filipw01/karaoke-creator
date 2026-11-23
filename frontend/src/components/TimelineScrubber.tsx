@@ -62,7 +62,6 @@ interface TimelineScrubberTrackProps {
   displayTime: number
   onTimelineClick: (e: MouseEvent & { currentTarget: HTMLDivElement }) => void
   onMouseDown: (e: MouseEvent & { currentTarget: HTMLDivElement }) => void
-  onMouseUp: () => void
   onSeekKeyDown: (e: KeyboardEvent & { currentTarget: HTMLDivElement }) => void
   children?: import("@solidjs/web").JSX.Element
 }
@@ -77,7 +76,6 @@ const TimelineScrubberTrack = (props: TimelineScrubberTrackProps) => {
       }}
       onClick={props.onTimelineClick}
       onMouseDown={props.onMouseDown}
-      onMouseUp={props.onMouseUp}
       class="relative h-12 cursor-pointer select-none"
       style={{ width: `${props.width}px` }}
       role="slider"
@@ -107,7 +105,6 @@ interface TimelineScrubberProps {
   onTrackReady?: (node: HTMLDivElement | null) => void
   onTimelineClick: (e: MouseEvent & { currentTarget: HTMLDivElement }) => void
   onMouseDown: (e: MouseEvent & { currentTarget: HTMLDivElement }) => void
-  onMouseUp: () => void
   onSeekKeyDown: (e: KeyboardEvent & { currentTarget: HTMLDivElement }) => void
 }
 
@@ -122,7 +119,6 @@ export const TimelineScrubber = (props: TimelineScrubberProps) => {
         displayTime={props.displayTime}
         onTimelineClick={props.onTimelineClick}
         onMouseDown={props.onMouseDown}
-        onMouseUp={props.onMouseUp}
         onSeekKeyDown={props.onSeekKeyDown}
       >
         <TimelineScrubberGrid
