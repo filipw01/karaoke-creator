@@ -12,34 +12,37 @@ static BREAK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^-\s*(-?[0-9]+)").
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Note {
-    note_type: String,
-    start_beat: i64,
-    duration_beats: i64,
-    pitch: i64,
-    text: String,
+    pub(crate) note_type: String,
+    pub(crate) start_beat: i64,
+    pub(crate) duration_beats: i64,
+    pub(crate) pitch: i64,
+    pub(crate) text: String,
 }
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Phrase {
-    notes: Vec<Note>,
-    end_beat: i64,
+    #[serde(default)]
+    pub(crate) notes: Vec<Note>,
+    #[serde(default)]
+    pub(crate) end_beat: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct Metadata {
+    pub(crate) title: String,
+    pub(crate) artist: String,
+    pub(crate) language: String,
+    pub(crate) genre: String,
+    pub(crate) year: String,
+    pub(crate) bpm: f64,
+    pub(crate) gap_ms: f64,
 }
 
 #[derive(Serialize)]
-pub(crate) struct Metadata {
-    title: String,
-    artist: String,
-    language: String,
-    genre: String,
-    year: String,
-    bpm: f64,
-    gap_ms: f64,
-}
-
 pub(crate) struct Chart {
     pub(crate) metadata: Metadata,
     pub(crate) phrases: Vec<Phrase>,
-    pitch_offset: i64,
+    pub(crate) pitch_offset: i64,
 }
 
 pub(crate) fn decode(raw: &[u8]) -> String {

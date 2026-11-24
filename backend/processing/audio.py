@@ -1,94 +1,27 @@
-"""Extract and convert audio from video/audio files using ffmpeg."""
+"""Shared audio adapters and model-specific FFmpeg preprocessing."""
 
 from __future__ import annotations
 
 import json
-import logging
 import os
 import subprocess
-import tempfile
-import threading
-from hashlib import sha256
 from pathlib import Path
 
-VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".flv", ".wmv", ".m4v"}
-_playback_cache_lock = threading.Lock()
-
-
-def is_video_file(input_path: str) -> bool:
-    """Check if the input file contains a video stream."""
-    ext = os.path.splitext(input_path)[1].lower()
-    if ext in VIDEO_EXTENSIONS:
-        return True
-    # Also probe with ffprobe in case extension is misleading
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", input_path],
-            capture_output=True, text=True,
-        )
-        data = json.loads(result.stdout)
-        return any(s.get("codec_type") == "video" for s in data.get("streams", []))
-    except Exception:
-        return False
+from processing.rust_utility import call as rust_utility
 
 
 def copy_video(input_path: str, output_path: str) -> str:
-    """Re-mux the video to MP4 (no re-encoding) for UltraStar compatibility."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-c", "copy",
-        "-movflags", "+faststart",
-        output_path,
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
-    return output_path
+    return rust_utility("encode_media", source=input_path, destination=output_path, video=True)
 
 
 def extract_audio(input_path: str, output_dir: str) -> str:
-    """Extract audio from a video/audio file and convert to WAV.
-
-    Returns the path to the output WAV file (44100 Hz stereo for Demucs).
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, "audio.wav")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-vn",
-        "-acodec", "pcm_s16le",
-        "-ar", "44100",
-        "-ac", "2",
-        output_path,
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
-    return output_path
+    return rust_utility("extract_audio", source=input_path, destination=os.path.join(output_dir, "audio.wav"))
 
 
 def playback_audio_path(source: Path, cache_dir: Path) -> Path:
-    """Use PCM for MP3 playback so the seek lands on the correct samples."""
     if source.suffix.lower() != ".mp3":
         return source
-
-    try:
-        info = source.stat()
-        key = sha256(os.fsencode(source))
-        key.update(f":{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}".encode())
-        cached = cache_dir / f"{key.hexdigest()}.wav"
-        if cached.is_file():
-            return cached
-
-        with _playback_cache_lock:
-            if not cached.is_file():
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                with tempfile.TemporaryDirectory(dir=cache_dir) as staging:
-                    wav = extract_audio(str(source), staging)
-                    os.replace(wav, cached)
-        return cached
-    except (OSError, subprocess.CalledProcessError):
-        logging.getLogger(__name__).exception("Could not prepare seekable audio for %s", source)
-        return source
+    return Path(rust_utility("playback_audio", source=str(source), cache=str(cache_dir)))
 
 
 def convert_to_mono_16k(input_path: str, output_path: str) -> str:
@@ -148,13 +81,4 @@ def normalize_audio(input_path: str, output_path: str) -> str:
 
 
 def convert_to_mp3(input_path: str, output_path: str) -> str:
-    """Convert audio to MP3 for the final output package."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-codec:a", "libmp3lame",
-        "-qscale:a", "2",
-        output_path,
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
-    return output_path
+    return rust_utility("encode_media", source=input_path, destination=output_path, video=False)

@@ -4,19 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import json
 import logging
 import math
 import mimetypes
 import os
 import shutil
-import stat
 import tempfile
 import threading
 import time
 import uuid
-import zipfile
+import wave
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from functools import partial
@@ -27,6 +25,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from models import (
     AlignmentEvidence,
@@ -45,7 +44,9 @@ from models import (
     WordAlignment,
 )
 from processing.audio import playback_audio_path
-from processing.external_chart import decode_chart_text, parse_chart, read_chart_text, update_chart
+from processing.desktop_lock import processing_slot
+from processing.external_chart import parse_chart, read_chart_text
+from processing.rust_utility import RustUtilityUnavailable, call as rust_utility, call_with_progress
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,7 +66,6 @@ app.add_middleware(
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
-YTDLP_CACHE_DIR = os.path.join(OUTPUT_DIR, "yt-dlp-cache")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -163,105 +163,28 @@ def _safe_child_path(root: str, filename: str) -> str:
     return candidate
 
 
+def _chart_payload(result: JobResult, *, content: str | None = None) -> dict[str, Any]:
+    return {
+        "metadata": asdict(result.metadata),
+        "ultrastar_txt": result.ultrastar_txt if content is None else content,
+        "audio_file": result.audio_file,
+        "vocals_file": result.vocals_file,
+        "instrumental_file": result.instrumental_file,
+        "video_file": result.video_file,
+    }
+
+
 def _publish_song_to_library(job: Job) -> None:
     """Publish a complete UltraStar song folder to the configured library."""
-
-    if not job.result:
-        return
     directory = _working_directory()
-    if not directory:
+    if not job.result or not directory:
         return
     root = Path(directory).expanduser().resolve()
-    if not root.is_dir():
-        raise RuntimeError(f"Working directory is unavailable: {root}")
-
-    safe_name = _sanitize_filename(
-        f"{job.result.metadata.artist} - {job.result.metadata.title}"
-    ) or "song"
-    destination = Path(job.library_path).resolve() if job.library_path else None
-    if destination is not None:
-        try:
-            destination.relative_to(root)
-        except ValueError:
-            destination = None
-    if destination is None:
-        destination = root / safe_name
-        suffix = 2
-        while destination.exists():
-            destination = root / f"{safe_name} ({suffix})"
-            suffix += 1
-    destination.mkdir(parents=True, exist_ok=True)
-
-    for filename in (
-        job.result.audio_file,
-        job.result.vocals_file,
-        job.result.instrumental_file,
-        job.result.video_file,
-    ):
-        if not filename:
-            continue
-        source = Path(_safe_child_path(job.work_dir, filename))
-        if not source.is_file():
-            raise RuntimeError(f"Required song asset is missing: {source.name}")
-        shutil.copy2(source, destination / source.name)
-
-    chart_name = f"{safe_name}.txt"
-    temporary_chart = destination / f".{chart_name}.tmp"
-    try:
-        temporary_chart.write_text(job.result.ultrastar_txt, encoding="utf-8")
-        os.replace(temporary_chart, destination / chart_name)
-    except OSError:
-        temporary_chart.unlink(missing_ok=True)
-        raise
-    job.library_path = str(destination)
+    job.library_path = rust_utility(
+        "publish", job_id=job.id, work=job.work_dir, library=str(root),
+        existing=job.library_path or None, chart=_chart_payload(job.result),
+    )
     job.library_root = str(root)
-
-
-def _youtube_runtime_options() -> dict[str, Any]:
-    """Configure yt-dlp's JavaScript challenge solver for YouTube."""
-
-    runtime_candidates = (
-        ("node", os.environ.get("KARAOKE_YTDLP_NODE_PATH", "").strip() or shutil.which("node")),
-        ("deno", os.environ.get("KARAOKE_YTDLP_DENO_PATH", "").strip() or shutil.which("deno")),
-    )
-    for runtime, path in runtime_candidates:
-        if path:
-            return {
-                "js_runtimes": {runtime: {"path": path}},
-                "remote_components": ["ejs:github"],
-                "cachedir": YTDLP_CACHE_DIR,
-            }
-
-    logging.warning(
-        "No JavaScript runtime found for YouTube downloads; install Node.js or Deno "
-        "to solve YouTube challenges"
-    )
-    return {"js_runtimes": {}, "remote_components": [], "cachedir": YTDLP_CACHE_DIR}
-
-
-def _youtube_download_options(job_upload_dir: str, progress_hook: Any) -> dict[str, Any]:
-    """Build yt-dlp options with challenge solving and a writable cache."""
-
-    os.makedirs(YTDLP_CACHE_DIR, exist_ok=True)
-    return {
-        "format": (
-            "bestvideo[height>=720][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height>=480][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-        ),
-        "outtmpl": os.path.join(job_upload_dir, "%(title)s.%(ext)s"),
-        "quiet": False,
-        "no_warnings": False,
-        "progress_hooks": [progress_hook],
-        "socket_timeout": 30,
-        "retries": 10,
-        "fragment_retries": 10,
-        "extractor_retries": 3,
-        "file_access_retries": 3,
-        "concurrent_fragment_downloads": 1,
-        "http_headers": {"Referer": "https://www.youtube.com/"},
-        **_youtube_runtime_options(),
-    }
 
 
 def _step(job: Job, status: JobStatus, message: str) -> float:
@@ -650,6 +573,11 @@ def _load_persisted_jobs() -> None:
                     job.queued_at = ""
                     job.error = ""
                     job.progress_message = "Waiting for lyrics approval."
+                elif job.failed_phase == "publish" and job.status == JobStatus.GENERATING and job.result:
+                    job.queued_at = ""
+                    job.status = JobStatus.ERROR
+                    job.error = "Library publication was interrupted."
+                    job.progress_message = "Retry publishing to reuse the finished chart and media."
                 elif job.status not in {JobStatus.DONE, JobStatus.ERROR, JobStatus.PENDING}:
                     job.queued_at = ""
                     job.status = JobStatus.PENDING
@@ -715,27 +643,8 @@ def _external_song_audio_path(chart: Path) -> Path | None:
     directory = _working_directory()
     if not directory:
         return None
-    try:
-        content = read_chart_text(chart)
-    except OSError:
-        return None
-    headers: dict[str, str] = {}
-    for line in content.splitlines():
-        if not line.startswith("#"):
-            continue
-        key, separator, value = line[1:].partition(":")
-        if separator:
-            headers[key.strip().upper()] = value.strip().strip("\"'")
-    audio_reference = headers.get("MP3") or headers.get("AUDIO") or headers.get("OGG")
-    if not audio_reference:
-        return None
-    root = Path(directory).resolve()
-    candidate = (chart.parent / audio_reference).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError:
-        return None
-    return candidate if candidate.is_file() else None
+    path = rust_utility("external_audio", root=str(Path(directory).resolve()), path=str(chart))
+    return Path(path) if path else None
 
 
 def _external_song_stem_paths(chart: Path) -> tuple[str, Path, Path, Path]:
@@ -763,7 +672,7 @@ async def _run_external_song_separation(
     output_directory: Path,
 ) -> None:
     try:
-        async with processing_semaphore:
+        async with processing_slot(OUTPUT_DIR, processing_semaphore):
             from processing.vocals import _demucs_available, separate_vocals
 
             if not await asyncio.to_thread(_demucs_available):
@@ -1229,6 +1138,9 @@ def _draft_words_from_audio(audio_path: str, language: str, params: Any) -> list
         except Exception:
             log = logging.getLogger("pipeline")
             log.exception("Qwen ASR draft generation failed; trying the local compatibility fallback")
+    if os.environ.get("KARAOKE_WHISPER_CPP_MODEL"):
+        words = rust_utility("whisper_draft", audio=audio_path, language=language)
+        return [Word(**word) for word in words]
     return list(run_serialized_model_call(extract_lyrics, audio_path, language, params))
 
 
@@ -1731,112 +1643,45 @@ async def _execute_realignment(
 
 
 async def _process_phase1(job: Job) -> None:
+    """Drive the shared Rust preparation pipeline and expose its status over HTTP."""
     job.failed_phase = "phase1"
     _persist_jobs()
+
+    # Rust owns the cross-process model lock. The API semaphore keeps browser
+    # job scheduling ordered without trying to acquire the same lock twice.
     async with processing_semaphore:
         job.queued_at = ""
+        job.work_dir = os.path.join(OUTPUT_DIR, job.id)
         _persist_jobs()
-        await _process_phase1_impl(job)
 
+        def progress(event: dict[str, Any]) -> None:
+            _step(job, JobStatus(event["status"]), event["message"])
 
-async def _process_phase1_impl(job: Job) -> None:
-    """Extract audio, separate vocals, detect BPM, and start alignment."""
-    log = logging.getLogger("pipeline")
-    loop = asyncio.get_event_loop()
-    pipeline_start = time.time()
-
-    try:
-        if not job.metadata.genre or not job.metadata.year:
-            from processing.metadata import lookup_release_metadata
-            release_metadata = await loop.run_in_executor(
-                None,
-                lookup_release_metadata,
-                job.metadata.title,
-                job.metadata.artist,
+        try:
+            media = await call_with_progress(
+                "prepare_browser_media", progress,
+                backend=str(Path(__file__).resolve().parent),
+                media={
+                    "source": job.upload_path, "work": job.work_dir, "prior_audio": job.audio_path or None,
+                    "has_video": job.has_video, "real_bpm": job.real_bpm, "metadata": asdict(job.metadata),
+                },
             )
-            if not job.metadata.genre:
-                job.metadata.genre = release_metadata["genre"]
-            if not job.metadata.year:
-                job.metadata.year = release_metadata["year"]
-            if release_metadata["genre"] or release_metadata["year"]:
-                _persist_jobs()
-
-        work_dir = os.path.join(OUTPUT_DIR, job.id)
-        os.makedirs(work_dir, exist_ok=True)
-        job.work_dir = work_dir
-        log.info("[%s] Phase 1 starting for '%s - %s'", job.id[:8], job.metadata.artist, job.metadata.title)
-
-        # --- Step 1: Extract audio (+ detect video) ---
-        from processing.audio import extract_audio, is_video_file
-        if not job.audio_path or not os.path.isfile(job.audio_path):
-            t = _step(job, JobStatus.EXTRACTING_AUDIO, "Extracting audio from input file...")
-            job.has_video = is_video_file(job.upload_path)
-            log.info("[%s] Input is %s", job.id[:8], "video" if job.has_video else "audio-only")
-            job.audio_path = await loop.run_in_executor(None, extract_audio, job.upload_path, work_dir)
-            _persist_jobs()
-            log.info("[%s] Audio extracted in %.1fs -> %s", job.id[:8], time.time() - t, job.audio_path)
-        else:
-            log.info("[%s] Reusing previously extracted audio at %s", job.id[:8], job.audio_path)
-
-        # --- Step 2: Separate vocals ---
-        if not job.vocals_path or not os.path.isfile(job.vocals_path):
-            t = _step(job, JobStatus.SEPARATING_VOCALS, "Separating vocals from instruments (this may take a few minutes)...")
-            from processing.vocals import separate_vocals
-            job.vocals_path, job.instrumental_path = await loop.run_in_executor(
-                None, separate_vocals, job.audio_path, work_dir
-            )
-            _persist_jobs()
-            log.info("[%s] Vocals separated in %.1fs", job.id[:8], time.time() - t)
-        elif job.instrumental_path and os.path.isfile(job.instrumental_path):
-            log.info("[%s] Reusing previously separated stems", job.id[:8])
-        else:
-            t = _step(job, JobStatus.SEPARATING_VOCALS, "Completing instrumental separation...")
-            from processing.vocals import separate_vocals
-            job.vocals_path, job.instrumental_path = await loop.run_in_executor(
-                None, separate_vocals, job.audio_path, work_dir
-            )
-            _persist_jobs()
-            log.info("[%s] Instrumental separation completed in %.1fs", job.id[:8], time.time() - t)
-
-        # --- Step 3: Detect BPM ---
-        if job.real_bpm <= 0:
-            t = _step(job, JobStatus.DETECTING_BPM, "Detecting song tempo (BPM)...")
-            from processing.bpm import detect_bpm
-            job.real_bpm = await loop.run_in_executor(None, detect_bpm, job.audio_path)
-            _persist_jobs()
-            log.info("[%s] BPM detected in %.1fs -> %.1f BPM", job.id[:8], time.time() - t, job.real_bpm)
-        else:
-            log.info("[%s] Reusing previously detected BPM %.1f", job.id[:8], job.real_bpm)
-
-        # --- Step 4: Search lyrics online ---
-        _step(job, JobStatus.SEARCHING_LYRICS, "Searching for lyrics online...")
-
-        from processing.lyrics_search import search_lyrics
-        found = await loop.run_in_executor(
-            None, search_lyrics, job.metadata.artist, job.metadata.title
-        ) or ""
-        job.found_lyrics = found
-
-        if found.strip() == "These are song lyrics with singing.":
-            found = ""
-            job.found_lyrics = ""
-
-        # Pause before creating a revision or starting model work so the user
-        # can reject a bad online match, edit it, or choose an alternative.
-        job.status = JobStatus.AWAITING_LYRICS
-        job.failed_phase = ""
-        job.progress_message = "Review lyrics before transcription"
-        _persist_jobs()
-        total = time.time() - pipeline_start
-        _notify(job)
-        log.info("[%s] Phase 1 complete in %.1fs — awaiting lyrics confirmation", job.id[:8], total)
-
-    except Exception as e:
-        log.exception("[%s] Phase 1 failed after %.1fs", job.id[:8], time.time() - pipeline_start)
-        job.status = JobStatus.ERROR
-        job.failed_phase = "phase1"
-        job.error = str(e)
-        job.progress_message = f"Error: {e}"
+            job.audio_path = media["audio_path"]
+            job.vocals_path = media["vocals_path"]
+            job.instrumental_path = media["instrumental_path"]
+            job.has_video = media["has_video"]
+            job.real_bpm = media["real_bpm"]
+            job.found_lyrics = media["found_lyrics"]
+            job.metadata.genre = media["metadata"]["genre"]
+            job.metadata.year = media["metadata"]["year"]
+            job.status = JobStatus.AWAITING_LYRICS
+            job.failed_phase = ""
+            job.progress_message = "Review lyrics before transcription"
+        except Exception as exc:
+            logging.getLogger("pipeline").exception("[%s] Preparation failed", job.id[:8])
+            job.status = JobStatus.ERROR
+            job.error = str(exc)
+            job.progress_message = f"Error: {exc}"
         _persist_jobs()
         _notify(job)
 
@@ -1844,10 +1689,43 @@ async def _process_phase1_impl(job: Job) -> None:
 async def _process_phase2(job: Job, lyrics_text: str) -> None:
     job.failed_phase = "phase2"
     _persist_jobs()
-    async with processing_semaphore:
+    async with processing_slot(OUTPUT_DIR, processing_semaphore):
         job.queued_at = ""
         _persist_jobs()
         await _process_phase2_impl(job, lyrics_text)
+
+
+def _complete_published_job(job: Job) -> None:
+    job.status = JobStatus.DONE
+    job.failed_phase = ""
+    job.error = ""
+    job.progress_message = "Done! Your karaoke song is ready."
+    result = job.result
+    if (
+        result and result.lyric_revision and result.alignment_run
+        and _enum_value(result.lyric_revision.language) == "en"
+        and "sofa" in result.alignment_run.selected_strategy
+        and not result.alignment_comparison
+    ):
+        result.alignment_comparison = {
+            "status": "running", "sofa_available": True, "legacy_available": False,
+        }
+        asyncio.create_task(_run_legacy_comparison(job, result.lyric_revision))
+    _persist_jobs()
+    _notify(job)
+
+
+async def _retry_library_publication(job: Job) -> None:
+    try:
+        await asyncio.to_thread(_publish_song_to_library, job)
+    except Exception as exc:
+        job.status = JobStatus.ERROR
+        job.error = str(exc)
+        job.progress_message = f"Unable to publish song: {exc}"
+        _persist_jobs()
+        _notify(job)
+        return
+    _complete_published_job(job)
 
 
 async def _process_phase2_impl(job: Job, lyrics_text: str) -> None:
@@ -2062,24 +1940,12 @@ async def _process_phase2_impl(job: Job, lyrics_text: str) -> None:
             alignment_run=canonical_run,
             audio_duration=_audio_duration(job.audio_path),
         )
-        _publish_song_to_library(job)
+        job.failed_phase = "publish"
+        _persist_jobs()
+        await asyncio.to_thread(_publish_song_to_library, job)
 
         total = time.time() - phase_start
-        job.status = JobStatus.DONE
-        job.failed_phase = ""
-        job.progress_message = "Done! Your karaoke song is ready."
-        # The SOFA result is available immediately; run the archived lane as a
-        # best-effort background task so it can be compared and selected later
-        # without regenerating the song.
-        if lang == "en" and "sofa" in canonical_run.selected_strategy:
-            job.result.alignment_comparison = {
-                "status": "running",
-                "sofa_available": True,
-                "legacy_available": False,
-            }
-            asyncio.create_task(_run_legacy_comparison(job, canonical_revision))
-        _persist_jobs()
-        _notify(job)
+        _complete_published_job(job)
         modes_str = ", ".join(sorted(variants_for_result.keys()))
         log.info("[%s] Phase 2 complete in %.1fs. Alignment modes: %s", job.id[:8], total, modes_str)
 
@@ -2090,7 +1956,8 @@ async def _process_phase2_impl(job: Job, lyrics_text: str) -> None:
             prior_diagnostics = initial_alignment_run.diagnostics if isinstance(initial_alignment_run.diagnostics, dict) else {}
             initial_alignment_run.diagnostics = {**prior_diagnostics, "error": str(e)}
         job.status = JobStatus.ERROR
-        job.failed_phase = "phase2"
+        if job.failed_phase != "publish":
+            job.failed_phase = "phase2"
         job.error = str(e)
         job.progress_message = f"Error: {e}"
         _persist_jobs()
@@ -2424,6 +2291,99 @@ async def upload_file(
     return {"job_id": job_id}
 
 
+class PreparedMediaImport(BaseModel):
+    import_id: uuid.UUID
+    title: str = ""
+    artist: str = ""
+    language: str = ""
+    genre: str = ""
+    year: str = ""
+
+
+class PreparedMediaManifest(BaseModel):
+    original_filename: str
+    has_video: bool
+
+
+@app.post("/api/desktop/import")
+async def register_prepared_media(request: Request, body: PreparedMediaImport) -> dict[str, str]:
+    """Register the files prepared by the local desktop process."""
+    from processing.alignment import normalize_language
+
+    if not request.client or request.client.host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        raise HTTPException(status_code=403, detail="Prepared media import requires a local backend")
+    job_id = str(body.import_id)
+    owner_id = _request_owner(request)
+    upload_dir = _safe_child_path(UPLOAD_DIR, job_id)
+    work_dir = _safe_child_path(OUTPUT_DIR, job_id)
+    upload_path = _safe_child_path(upload_dir, "input")
+    audio_path = _safe_child_path(work_dir, "audio.wav")
+
+    existing = jobs.get(job_id)
+    if existing:
+        if existing.owner_id == owner_id and existing.upload_path == upload_path:
+            return {"job_id": job_id}
+        raise HTTPException(status_code=404, detail="Prepared media not found")
+
+    manifest_path = Path(_safe_child_path(upload_dir, "prepared-media.json"))
+    try:
+        manifest = PreparedMediaManifest.model_validate_json(manifest_path.read_bytes())
+        original_size = Path(upload_path).stat().st_size
+        if original_size > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Selected file is too large")
+        with wave.open(audio_path, "rb") as audio:
+            pcm_format = (audio.getnchannels(), audio.getsampwidth(), audio.getframerate())
+            if pcm_format != (2, 2, 44100) or not audio.getnframes():
+                raise ValueError("Expected a nonempty 44.1 kHz stereo PCM WAV")
+        if not original_size or not Path(upload_path).is_file() or not manifest.original_filename:
+            raise ValueError("Prepared import is missing the original media")
+        language = normalize_language(body.language or "en")
+        record = _safe_child_path(upload_dir, "desktop-preparation.json")
+        prepared = json.loads(Path(record).read_text(encoding="utf-8"))
+        if not isinstance(prepared, dict) or prepared.get("status") != "awaiting_lyrics":
+            raise ValueError("Desktop preparation has not reached lyrics review")
+        bpm = prepared.get("real_bpm")
+        if isinstance(bpm, bool) or not isinstance(bpm, (int, float)) or not math.isfinite(bpm) or bpm < 0:
+            raise ValueError("Invalid prepared tempo")
+        for track in ("vocals.wav", "instrumental.wav"):
+            with wave.open(_safe_child_path(work_dir, track), "rb") as stem:
+                if not stem.getnframes():
+                    raise ValueError(f"Prepared {track} is empty")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Prepared media not found in this backend") from exc
+    except (ValueError, wave.Error, EOFError, OSError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid prepared media: {exc}") from exc
+
+    jobs[job_id] = Job(
+        id=job_id,
+        owner_id=owner_id,
+        original_filename=manifest.original_filename,
+        upload_path=upload_path,
+        work_dir=work_dir,
+        audio_path=audio_path,
+        has_video=manifest.has_video,
+        status=JobStatus.AWAITING_LYRICS,
+        progress_message="Waiting for lyrics approval.",
+        vocals_path=_safe_child_path(work_dir, "vocals.wav"),
+        instrumental_path=_safe_child_path(work_dir, "instrumental.wav"),
+        real_bpm=float(prepared.get("real_bpm", 0.0)),
+        found_lyrics=str(prepared.get("found_lyrics", "")),
+        metadata=SongMetadata(
+            title=body.title or Path(manifest.original_filename).stem,
+            artist=body.artist,
+            language=language,
+            genre=body.genre,
+            year=body.year,
+        ),
+    )
+    try:
+        _persist_jobs()
+    except Exception:
+        jobs.pop(job_id)
+        raise
+    return {"job_id": job_id}
+
+
 @app.post("/api/process/{job_id}/start")
 async def start_processing(job_id: str) -> dict[str, str]:
     """Start Phase 1 of the processing pipeline."""
@@ -2453,7 +2413,12 @@ async def retry_job(job_id: str) -> dict[str, str]:
     phase = job.failed_phase
     job.error = ""
     job.progress_percent = 0.0
-    if phase == "download":
+    if phase == "publish" and job.result:
+        job.status = JobStatus.GENERATING
+        job.progress_message = "Publishing the finished song…"
+        _persist_jobs()
+        asyncio.create_task(_retry_library_publication(job))
+    elif phase == "download":
         if not job.source_url:
             raise HTTPException(status_code=409, detail="The original YouTube URL is unavailable; upload or select the song again")
         req = YouTubeDownloadRequest(
@@ -3122,7 +3087,7 @@ async def get_audio(job_id: str, track: str) -> FileResponse:
 
 
 @app.get("/api/jobs/{job_id}/download")
-async def download_zip(job_id: str, alignment_mode: str | None = None) -> StreamingResponse:
+async def download_zip(job_id: str, alignment_mode: str | None = None) -> FileResponse:
     """Download a ZIP containing TXT + all audio files. Optional alignment_mode uses that variant's TXT."""
     job = jobs.get(job_id)
     if not job:
@@ -3149,33 +3114,19 @@ async def download_zip(job_id: str, alignment_mode: str | None = None) -> Stream
         f"{job.result.metadata.artist} - {job.result.metadata.title}"
     ) or "song"
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        folder = safe_name
-
-        # TXT file
-        zf.writestr(f"{folder}/{safe_name}.txt", txt_content)
-
-        # Audio + video files
-        for filename in [
-            job.result.audio_file,
-            job.result.vocals_file,
-            job.result.instrumental_file,
-            job.result.video_file,
-        ]:
-            if not filename:
-                continue
-            filepath = _safe_child_path(job.work_dir, filename)
-            if os.path.exists(filepath):
-                zf.write(filepath, f"{folder}/{filename}")
-
-    buf.seek(0)
-    return StreamingResponse(
-        buf,
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{safe_name}.zip"'
-        },
+    staging = tempfile.TemporaryDirectory(prefix="karaoke-export-")
+    archive = Path(staging.name) / "export.zip"
+    try:
+        await asyncio.to_thread(
+            rust_utility, "archive", chart=_chart_payload(job.result, content=txt_content),
+            work=job.work_dir, destination=str(archive),
+        )
+    except BaseException:
+        staging.cleanup()
+        raise
+    return FileResponse(
+        archive, media_type="application/zip", filename=f"{safe_name}.zip",
+        background=BackgroundTask(staging.cleanup),
     )
 
 
@@ -3224,47 +3175,14 @@ async def set_working_directory(body: dict[str, Any]) -> dict[str, str | None]:
 
 
 def _list_external_charts(directory: str | None, published_charts: set[Path]) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    if directory and os.path.isdir(directory):
-        root = Path(directory).resolve()
-        published_charts = {chart.resolve() for chart in published_charts}
-        for current, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames[:] = [
-                name for name in dirnames
-                if not (Path(current) / name).is_symlink()
-            ]
-            for filename in filenames:
-                chart = Path(current) / filename
-                if chart.suffix.lower() != ".txt" or chart.is_symlink():
-                    continue
-                relative_path = chart.relative_to(root).as_posix()
-                if chart.resolve() in published_charts:
-                    continue
-                try:
-                    with chart.open("rb") as file:
-                        header = decode_chart_text(b"".join(file.readline() for _ in range(80)))
-                except OSError:
-                    continue
-                metadata: dict[str, str] = {}
-                for line in header.splitlines():
-                    if ":" not in line:
-                        continue
-                    key, value = line.split(":", 1)
-                    if key.strip().upper() in {"#TITLE", "#ARTIST"}:
-                        metadata[key.strip().upper()] = value.strip()
-                items.append({
-                    "id": f"external:{relative_path}",
-                    "kind": "external",
-                    "title": metadata.get("#TITLE") or chart.stem,
-                    "artist": metadata.get("#ARTIST", ""),
-                    "filename": filename,
-                    "folder": str(Path(relative_path).parent) if Path(relative_path).parent != Path(".") else "",
-                    "path": relative_path,
-                    "status": "external",
-                    "message": "Existing UltraStar song",
-                    "progress_percent": 0,
-                })
-    return items
+    if not directory or not os.path.isdir(directory):
+        return []
+    root = Path(directory).resolve()
+    published = {chart.resolve() for chart in published_charts}
+    return [
+        song for song in rust_utility("scan_library", directory=str(root))["songs"]
+        if (root / song["path"]).resolve() not in published
+    ]
 
 
 @app.get("/api/library")
@@ -3388,79 +3306,17 @@ async def get_external_song_separation_status(path: str) -> dict[str, str]:
 @app.put("/api/library/external-song")
 async def save_external_song(path: str, body: dict[str, Any]) -> dict[str, str]:
     chart = _external_song_path(path)
-    try:
-        content = read_chart_text(chart)
-        parsed = parse_chart(content, chart.stem)
-    except OSError as exc:
-        raise HTTPException(status_code=404, detail="Song file is unavailable") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    phrase_values = body.get("phrases")
-    if not isinstance(phrase_values, list):
+    if not isinstance(body.get("phrases"), list):
         raise HTTPException(status_code=422, detail="phrases must be an array")
-    phrases: list[Phrase] = []
     try:
-        for phrase_value in phrase_values:
-            if not isinstance(phrase_value, dict) or not isinstance(phrase_value.get("notes", []), list):
-                raise ValueError("Each phrase must contain a notes array")
-            end_beat = phrase_value.get("end_beat", 0)
-            if isinstance(end_beat, bool) or not isinstance(end_beat, int) or end_beat < 0:
-                raise ValueError("phrase end_beat must be a non-negative integer")
-            notes: list[UltraStarNote] = []
-            for note_value in phrase_value.get("notes", []):
-                if not isinstance(note_value, dict):
-                    raise ValueError("Each note must be an object")
-                note_type = note_value.get("note_type")
-                text = note_value.get("text")
-                start_beat = note_value.get("start_beat")
-                duration_beats = note_value.get("duration_beats")
-                pitch = note_value.get("pitch")
-                if not isinstance(note_type, str) or not isinstance(text, str):
-                    raise ValueError("note_type and text must be strings")
-                if note_type not in {":", "*", "F", "R", "G"}:
-                    raise ValueError(f"Unsupported note type: {note_type}")
-                integer_values = (start_beat, duration_beats, pitch)
-                if any(isinstance(value, bool) or not isinstance(value, int) for value in integer_values):
-                    raise ValueError("note timing and pitch values must be integers")
-                if start_beat < 0 or duration_beats < 0:
-                    raise ValueError("note timing values must be non-negative")
-                notes.append(UltraStarNote(
-                    note_type=note_type,
-                    start_beat=start_beat,
-                    duration_beats=duration_beats,
-                    pitch=pitch,
-                    text=text,
-                ))
-            phrases.append(Phrase(notes=notes, end_beat=end_beat))
-        if not any(phrase.notes for phrase in phrases):
-            raise ValueError("A chart must contain at least one note")
-        updated_content = update_chart(content, phrases, parsed["pitch_offset"])
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid note payload: {exc}") from exc
-
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="\n",
-            dir=chart.parent,
-            prefix=f".{chart.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-            temporary_file.write(updated_content)
-        os.chmod(temporary_path, stat.S_IMODE(chart.stat().st_mode))
-        os.replace(temporary_path, chart)
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail="Failed to save existing song chart") from exc
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-
-    return {"status": "updated", "content": updated_content}
+        updated = await asyncio.to_thread(
+            rust_utility, "save_external_chart", path=str(chart), phrases=body["phrases"],
+        )
+    except RustUtilityUnavailable:
+        raise
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid chart edit: {exc}") from exc
+    return {"status": "updated", "content": updated}
 
 
 @app.get("/api/library/external-song/download")
@@ -3531,19 +3387,10 @@ async def remove_library_song(
     if not directory:
         raise HTTPException(status_code=409, detail="Working directory is not configured")
     root = Path(directory).resolve()
-    if chart.parent == root:
-        try:
-            chart.unlink()
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail="Unable to remove song file") from exc
-    else:
-        try:
-            chart.parent.relative_to(root)
-            shutil.rmtree(chart.parent)
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail="Unable to remove song directory and its files") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail="Song directory is outside the working directory") from exc
+    try:
+        await asyncio.to_thread(rust_utility, "remove_external_chart", root=str(root), path=str(chart))
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {"removed": path}
 
 
@@ -3563,6 +3410,7 @@ async def get_status(job_id: str) -> dict[str, Any]:
     }
     if job.error:
         result["error"] = job.error
+        result["failed_phase"] = job.failed_phase
     if job.status == JobStatus.AWAITING_LYRICS:
         result["found_lyrics"] = job.found_lyrics
     if job.status == JobStatus.DOWNLOADING:
@@ -3593,53 +3441,13 @@ class YouTubeSearchResult(BaseModel):
 async def search_youtube(req: YouTubeSearchRequest) -> dict[str, list[dict[str, Any]]]:
     """Search YouTube for videos."""
     try:
-        import yt_dlp
-        
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": "in_playlist",
-            "default_search": "ytsearch10",
-            "ignoreerrors": True,  # Skip unavailable/private videos in search results
-            "socket_timeout": 30,
-            **_youtube_runtime_options(),
-        }
-
-        def run_search() -> list[dict[str, Any]]:
-            results: list[dict[str, Any]] = []
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                search_query = f"ytsearch10:{req.query}"
-                info = ydl.extract_info(search_query, download=False)
-
-                for entry in info.get("entries", []):
-                    if not entry:
-                        continue
-                    video_id = entry.get("id", "")
-                    if not video_id:
-                        continue
-                    thumbnail = entry.get("thumbnail")
-                    if not thumbnail:
-                        thumbnails = entry.get("thumbnails") or []
-                        thumbnail = thumbnails[-1].get("url") if thumbnails else None
-                    if not thumbnail:
-                        thumbnail = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
-                    results.append({
-                        "id": video_id,
-                        "title": entry.get("title", ""),
-                        "channel": entry.get("channel", entry.get("uploader", "")),
-                        "duration": entry.get("duration"),
-                        "thumbnail": thumbnail,
-                        "url": f"https://www.youtube.com/watch?v={video_id}",
-                    })
-            return results
-
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(None, run_search)
-        
-        return {"results": results}
-    except Exception as e:
-        logging.error(f"YouTube search failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+        results = await asyncio.to_thread(
+            rust_utility, "search_youtube", backend=str(Path(__file__).resolve().parent),
+            query=req.query,
+        )
+    except (RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=f"Search failed: {exc}") from exc
+    return {"results": results}
 
 
 class YouTubeDownloadRequest(BaseModel):
@@ -3693,120 +3501,35 @@ async def _download_youtube_video(job_id: str, req: YouTubeDownloadRequest) -> N
     job = jobs.get(job_id)
     if not job:
         return
-    
-    try:
-        import yt_dlp
-        
-        job_upload_dir = os.path.join(UPLOAD_DIR, job_id)
-        os.makedirs(job_upload_dir, exist_ok=True)
-        
-        def progress_hook(d: dict[str, Any]) -> None:
-            """Update job progress from yt-dlp download progress."""
-            if d.get("status") == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate")
-                downloaded = d.get("downloaded_bytes", 0)
-                if total and total > 0:
-                    percent = (downloaded / total) * 100
-                    job.progress_percent = percent
-                    speed = d.get("speed", 0)
-                    speed_mb = speed / (1024 * 1024) if speed else 0
-                    job.progress_message = f"Downloading... {percent:.1f}% ({speed_mb:.1f} MB/s)"
-                else:
-                    # Estimate progress if total unknown
-                    downloaded_mb = downloaded / (1024 * 1024)
-                    job.progress_message = f"Downloading... {downloaded_mb:.1f} MB"
-                    # Set a small progress to show activity
-                    if downloaded > 0:
-                        job.progress_percent = min(90.0, downloaded_mb / 10.0)  # Rough estimate
-                _notify(job)
-            elif d.get("status") == "finished":
-                job.progress_percent = 100.0
-                job.progress_message = "Download complete, processing..."
-                _notify(job)
-        
-        # Download video - prioritize HD (720p, 1080p, etc.)
-        loop = asyncio.get_event_loop()
-        upload_path = None
-        
-        def download_sync():
-            nonlocal upload_path
-            base_options = _youtube_download_options(job_upload_dir, progress_hook)
-            format_choices = [
-                base_options["format"],
-                "best[ext=mp4]/best",
-            ]
-            last_error: Exception | None = None
-            for attempt, format_choice in enumerate(format_choices):
-                if attempt:
-                    for filename in os.listdir(job_upload_dir):
-                        path = os.path.join(job_upload_dir, filename)
-                        if os.path.isfile(path):
-                            os.remove(path)
-                options = {**base_options, "format": format_choice}
-                try:
-                    with yt_dlp.YoutubeDL(options) as ydl:
-                        info = ydl.extract_info(req.url, download=True)
-                    if not info:
-                        raise RuntimeError("YouTube returned no video information")
-                    files = [
-                        os.path.join(job_upload_dir, name)
-                        for name in os.listdir(job_upload_dir)
-                        if os.path.isfile(os.path.join(job_upload_dir, name))
-                        and not name.endswith((".part", ".ytdl"))
-                    ]
-                    if files:
-                        upload_path = max(files, key=os.path.getsize)
-                        return info
-                    raise RuntimeError("YouTube download completed without creating a video file")
-                except Exception as exc:
-                    last_error = exc
-                    logging.warning(
-                        "YouTube download attempt %s failed for job %s: %s",
-                        attempt + 1,
-                        job_id[:8],
-                        exc,
-                    )
-            if last_error:
-                raise last_error
-            raise RuntimeError("YouTube download failed without an error detail")
-        
-        info = await loop.run_in_executor(None, download_sync)
-        
-        if not upload_path or not os.path.exists(upload_path):
-            job.status = JobStatus.ERROR
-            job.error = "Downloaded file not found"
-            job.progress_message = "Download failed"
-            _persist_jobs()
+
+    def progress(event: dict[str, Any]) -> None:
+        percent = float(event["progress_percent"])
+        if percent > job.progress_percent:
+            job.progress_percent = percent
+            job.progress_message = f"Downloading... {percent:.1f}%"
             _notify(job)
-            return
-        
-        # Extract title/artist from video info if not provided
-        video_title = req.title or info.get("title", "")
-        video_artist = req.artist or info.get("uploader", info.get("channel", ""))
-        
-        # Update job with file info and set to PENDING for processing
-        job.original_filename = os.path.basename(upload_path)
-        job.upload_path = upload_path
+
+    try:
+        media = await call_with_progress(
+            "download_youtube", progress, backend=str(Path(__file__).resolve().parent), job_id=job_id, url=req.url,
+        )
+        job.original_filename = media["original_filename"]
+        job.upload_path = media["upload_path"]
+        job.audio_path = media["audio_path"]
+        job.work_dir = media["work_dir"]
+        job.has_video = media["has_video"]
+        job.metadata.title = req.title or media["title"]
+        job.metadata.artist = req.artist or media["artist"]
         job.status = JobStatus.PENDING
         job.failed_phase = ""
         job.progress_message = "Download complete"
-        job.metadata.title = video_title or job.metadata.title
-        job.metadata.artist = video_artist or job.metadata.artist
         _persist_jobs()
         _notify(job)
-        
-    except Exception as e:
-        logging.error(f"YouTube download failed: {e}")
+    except Exception as exc:
+        logging.getLogger("pipeline").exception("YouTube download failed")
         job.status = JobStatus.ERROR
         job.failed_phase = "download"
-        detail = str(e)
-        if "403" in detail or "forbidden" in detail.lower():
-            detail = (
-                "YouTube refused this download (HTTP 403). Retry the download; "
-                "if it keeps happening, update yt-dlp and check whether YouTube "
-                "is restricting your network or region. Details: " + detail
-            )
-        job.error = detail
-        job.progress_message = f"Download failed: {detail}"
+        job.error = str(exc)
+        job.progress_message = f"Download failed: {exc}"
         _persist_jobs()
         _notify(job)

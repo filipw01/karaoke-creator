@@ -1,5 +1,14 @@
+mod catalog;
+mod chart_output;
 mod external_chart;
 mod library;
+mod media;
+mod native_pitch;
+mod preparation;
+mod tempo;
+mod whisper_draft;
+mod worker;
+mod youtube;
 
 use tauri::Manager;
 
@@ -29,18 +38,11 @@ fn start_dev_backend(directory: &std::path::Path) {
         return;
     }
 
-    let venv = if cfg!(windows) {
-        "venv/Scripts/python.exe"
-    } else {
-        "venv/bin/python"
-    };
-    let python = directory.join(venv);
-    let python = if python.is_file() {
-        python
-    } else {
-        std::path::PathBuf::from("python3")
-    };
-    if let Err(error) = std::process::Command::new(python)
+    let mut command = std::process::Command::new(worker::python_executable(directory));
+    if let Ok(executable) = std::env::current_exe() {
+        command.env("KARAOKE_RUST_UTILITY", executable);
+    }
+    if let Err(error) = command
         .args([
             "-m",
             "uvicorn",
@@ -61,6 +63,41 @@ fn start_dev_backend(directory: &std::path::Path) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--desktop-pyin")) {
+        let dimensions = std::env::args()
+            .skip(2)
+            .take(2)
+            .map(|argument| argument.parse::<usize>())
+            .collect::<Result<Vec<_>, _>>();
+        let result = match dimensions.as_deref() {
+            Ok(&[frame, hop]) => native_pitch::run_pyin(frame, hop),
+            _ => Err("pYIN requires a frame and hop length".into()),
+        };
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--desktop-pitch")) {
+        let model = std::env::args_os().nth(2);
+        let result = model
+            .as_deref()
+            .ok_or("Missing ONNX model".into())
+            .and_then(|path| native_pitch::run(std::path::Path::new(path)));
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--desktop-utility") {
+        if let Err(error) = chart_output::utility() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -71,10 +108,28 @@ pub fn run() {
             library::save_external_chart,
             library::remove_external_chart,
             library::export_external_chart,
+            media::pick_local_media,
+            media::inspect_local_media,
+            media::prepare_local_media,
+            preparation::register_native_media,
+            preparation::register_native_download,
+            preparation::list_native_jobs,
+            preparation::native_job_status,
+            preparation::start_native_job,
+            preparation::retire_native_job,
+            preparation::remove_native_job,
+            catalog::parse_local_filename,
+            catalog::search_local_lyrics,
+            youtube::search_local_youtube,
+            chart_output::save_managed_zip,
         ])
         .setup(|app| {
             let data = app.path().app_data_dir()?;
             let settings = data.join("working-directory.json");
+            #[cfg(debug_assertions)]
+            let backend = backend_directory();
+            #[cfg(not(debug_assertions))]
+            let backend = None;
 
             #[cfg(debug_assertions)]
             let settings = {
@@ -83,8 +138,8 @@ pub fn run() {
                         .level(log::LevelFilter::Info)
                         .build(),
                 )?;
-                if let Some(backend) = backend_directory() {
-                    start_dev_backend(&backend);
+                if let Some(backend) = &backend {
+                    start_dev_backend(backend);
                     backend.join("outputs/working-directory.json")
                 } else {
                     settings
@@ -92,6 +147,8 @@ pub fn run() {
             };
 
             app.manage(library::Library::new(settings, data.join("playback-audio")));
+            app.manage(media::LocalImport(backend));
+            app.manage(preparation::PreparationQueue::default());
             Ok(())
         })
         .run(tauri::generate_context!())

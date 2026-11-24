@@ -10,12 +10,13 @@ Create UltraStar Deluxe karaoke songs from any audio or video file.
 4. **Pitch detection** — analyzes the separated vocal stem with the bundled
    Basic Pitch ONNX tracker (falling back to centered pYIN), confidence-weighted
    note tracking, and continuation-aware split handling
-5. **BPM detection** — detects song tempo using librosa
+5. **BPM detection** — estimates song tempo in Rust
 6. **UltraStar generation** — combines everything into a valid UltraStar Deluxe TXT file
 
 ## Prerequisites
 
 - Python 3.11+
+- Rust 1.90+
 - Node.js 18+
 - ffmpeg installed and available in PATH
 
@@ -57,6 +58,38 @@ npm run tauri:dev
 
 In development, the desktop shell starts the Python API on `127.0.0.1:8000` when it is not already running. The Vite frontend uses it for managed jobs and stem separation.
 
+For desktop imports, Rust runs the preparation queue through lyrics review.
+It copies files, supervises yt-dlp, and prepares 44.1 kHz stereo PCM WAVs
+with FFmpeg. A local Python worker runs Demucs. Rust detects tempo and
+handles filename, release, and lyrics lookup. After approval, Python
+continues with alignment and owns managed editor state.
+
+Rust is also the implementation behind the browser API for media preparation,
+YouTube, catalog lookup, chart handling, publishing, and ZIP export. Run
+`backend/run.sh` to build the Rust utility before starting the browser API.
+When starting Uvicorn directly, first build the utility with
+`cargo build --locked --manifest-path frontend/src-tauri/Cargo.toml --bin app`
+from the repo root. The API finds `target/debug/app` automatically. Set
+`KARAOKE_RUST_UTILITY` to point to a different build. **Retry publish** reuses
+the finished chart and media after a library write failure.
+
+`KARAOKE_PYTHON` can select the Python interpreter used by the desktop
+process. Set `KARAOKE_YTDLP_PATH` to use a standalone yt-dlp executable.
+
+#### Audio backends
+
+Rust detects tempo and uses 120 BPM when the audio has no reliable tempo
+estimate. Rust also runs pYIN. With the Basic Pitch graph available, the
+Rust backend can run Basic Pitch through ONNX Runtime. Set
+`BASIC_PITCH_MODEL_PATH` to the ONNX graph and `ORT_DYLIB_PATH` to the
+ONNX Runtime 1.24 shared library. Resampling and note assignment still run
+alongside the Python alignment pipeline.
+
+Set `KARAOKE_WHISPER_CPP_MODEL` to a multilingual GGML Whisper checkpoint
+to use whisper.cpp for draft lyrics. Set `KARAOKE_WHISPER_CPP_PATH` if
+`whisper-cli` is outside PATH. Forced alignment and its ASR evidence still
+use the existing Python models.
+
 On first launch, choose a working directory for your song library. You can
 open, play, edit, and save existing UltraStar charts in the desktop app without
 Python. When FFmpeg is on PATH, the app caches a PCM copy of MP3 tracks for
@@ -74,8 +107,7 @@ confirmation dialog.
 
 ```bash
 cd backend
-source venv/bin/activate
-uvicorn main:app --reload --host 0.0.0.0 --port 8000 --reload-exclude venv
+./run.sh
 ```
 
 WhisperX CTC is enabled by default. Set the device explicitly only when needed:
@@ -322,5 +354,5 @@ Place the extracted folder into your UltraStar Deluxe songs directory.
 
 ## Tech stack
 
-- **Backend**: Python, FastAPI, Demucs, WhisperX, faster-whisper, Basic Pitch ONNX, librosa/pYIN
+- **Backend**: Rust for media and charts, Basic Pitch ONNX and Rust pYIN for pitch detection, and Python/FastAPI for Demucs, WhisperX, and faster-whisper
 - **Frontend**: React, TypeScript, Vite, TailwindCSS

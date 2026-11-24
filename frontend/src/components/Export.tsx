@@ -1,5 +1,7 @@
+import { createSignal, Show } from "solid-js"
+import { isTauri } from "@tauri-apps/api/core"
 import type { JobResult } from "../types"
-import { getDownloadUrl } from "../api"
+import { getDownloadUrl, saveManagedZip } from "../api"
 
 interface ExportProps {
   jobId: string
@@ -9,6 +11,19 @@ interface ExportProps {
 }
 
 export const Export = (props: ExportProps) => {
+  const [saving, setSaving] = createSignal(false)
+  const [exportError, setExportError] = createSignal("")
+  const saveZip = async () => {
+    setExportError("")
+    setSaving(true)
+    try {
+      await saveManagedZip(props.jobId)
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : "Unable to save ZIP")
+    } finally {
+      setSaving(false)
+    }
+  }
 
   return (
     <div class="max-w-xl mx-auto text-center space-y-8">
@@ -95,14 +110,19 @@ export const Export = (props: ExportProps) => {
         >
           Back to Editor
         </button>
-        <a
+        <Show when={isTauri()} fallback={<a
           href={getDownloadUrl(props.jobId)}
           download
           class="bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500
                      text-white font-medium px-8 py-3 rounded-xl transition-all inline-block"
         >
           Download ZIP
-        </a>
+        </a>}>
+          <button type="button" onClick={() => void saveZip()} disabled={saving()}
+            class="bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white font-medium px-8 py-3 rounded-xl">
+            {saving() ? "Saving ZIP…" : "Save ZIP"}
+          </button>
+        </Show>
         <button
           onClick={props.onStartOver}
           class="bg-zinc-700 hover:bg-zinc-600 text-white px-6 py-3 rounded-xl
@@ -111,6 +131,7 @@ export const Export = (props: ExportProps) => {
           New Song
         </button>
       </div>
+      <Show when={exportError()}><p role="alert" class="text-sm text-red-300">{exportError()}</p></Show>
 
       {/* Instructions */}
       <div class="bg-zinc-800/40 border border-zinc-700/30 rounded-xl p-4 text-left text-sm text-zinc-500">

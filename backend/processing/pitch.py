@@ -239,11 +239,7 @@ def _pitch_detector_name() -> str:
     # is absent. This also keeps the timestamp correction in word assignment
     # aligned with the detector that actually ran.
     if _basic_pitch_model_path() is not None:
-        try:
-            import onnxruntime  # noqa: F401
-            return "basic_pitch"
-        except ImportError:
-            pass
+        return "basic_pitch"
     return "pyin"
 
 
@@ -492,6 +488,13 @@ def _highpass_audio(audio: np.ndarray, sample_rate: int, cutoff_hz: float) -> np
         return filtered
 
 
+def _basic_pitch_session(model_path: Path):
+    from processing.native_pitch import NativePitchSession
+    from processing.rust_utility import executable_path
+
+    return NativePitchSession(executable_path(), model_path)
+
+
 def _detect_basic_pitch(
     vocals_path: str,
     *,
@@ -510,11 +513,6 @@ def _detect_basic_pitch(
         raise RuntimeError(
             "Basic Pitch ONNX weights are unavailable; set BASIC_PITCH_MODEL_PATH"
         )
-    try:
-        import onnxruntime as ort
-    except ImportError as exc:
-        raise RuntimeError("onnxruntime is required for Basic Pitch detection") from exc
-
     y, sr = librosa.load(vocals_path, sr=BASIC_PITCH_SAMPLE_RATE, mono=True)
     if highpass_hz > 0.0:
         y = _highpass_audio(y, sr, highpass_hz)
@@ -550,109 +548,89 @@ def _detect_basic_pitch(
         overlap_samples = overlap_frames * 256
         window_hop_samples = BASIC_PITCH_WINDOW_HOP_SAMPLES
     padded = np.concatenate((np.zeros(overlap_samples // 2, dtype=np.float32), y))
-    # Use a sequential single-threaded ONNX session by default. Besides
-    # keeping peak memory predictable on local laptops, this makes near-tied
-    # posterior values deterministic; multi-threaded reductions otherwise
-    # changed argpartition order between identical benchmark runs.
-    session_options = ort.SessionOptions()
-    try:
-        session_options.intra_op_num_threads = max(
-            1, int(os.environ.get("BASIC_PITCH_INTRA_THREADS", "1"))
-        )
-        session_options.inter_op_num_threads = max(
-            1, int(os.environ.get("BASIC_PITCH_INTER_THREADS", "1"))
-        )
-    except (TypeError, ValueError):
-        session_options.intra_op_num_threads = 1
-        session_options.inter_op_num_threads = 1
-    session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    session = ort.InferenceSession(
-        str(model_path),
-        sess_options=session_options,
-        providers=["CPUExecutionProvider"],
-    )
-    input_name = session.get_inputs()[0].name
-    note_parts: list[np.ndarray] = []
-    onset_parts: list[np.ndarray] = []
-    time_parts: list[np.ndarray] = []
-    for start in range(0, len(padded), window_hop_samples):
-        window = padded[start : start + BASIC_PITCH_INPUT_SAMPLES]
-        if len(window) < BASIC_PITCH_INPUT_SAMPLES:
-            window = np.pad(window, (0, BASIC_PITCH_INPUT_SAMPLES - len(window)))
-        outputs = session.run(None, {input_name: window.astype(np.float32)[None, :, None]})
-        # The ONNX export orders outputs as onset, note, contour.  Resolve by
-        # shape rather than relying on that order in case a future export
-        # reorders the graph outputs.
-        output_infos = session.get_outputs()
-        note_output = next(
-            (
-                np.asarray(output)[0]
-                for info, output in zip(output_infos, outputs)
-                if info.name.endswith(":1")
-                and np.asarray(output).ndim == 3
-                and np.asarray(output).shape[-1] == 88
-            ),
-            None,
-        )
-        if note_output is None:
-            # Older exports do not preserve TensorFlow's output names.  In
-            # that case the second 88-bin output is the note activation; the
-            # first is the onset activation and the 264-bin output is the
-            # fine contour.
-            note_candidates = [
-                np.asarray(output)[0]
-                for output in outputs
-                if np.asarray(output).ndim == 3
-                and np.asarray(output).shape[-1] == 88
-            ]
-            if len(note_candidates) == 2:
-                note_output = note_candidates[1]
-        if note_output is None:
-            raise RuntimeError("Basic Pitch ONNX output has no 88-bin note activation")
-        onset_output = next(
-            (
-                np.asarray(output)[0]
-                for info, output in zip(output_infos, outputs)
-                if info.name.endswith(":2")
-                and np.asarray(output).ndim == 3
-                and np.asarray(output).shape[-1] == 88
-            ),
-            None,
-        )
-        if onset_output is None:
-            onset_candidates = [
-                np.asarray(output)[0]
-                for output in outputs
-                if np.asarray(output).ndim == 3
-                and np.asarray(output).shape[-1] == 88
-            ]
-            if len(onset_candidates) == 2:
-                onset_output = onset_candidates[0]
-        note_output = note_output[trim_frames:-trim_frames or None]
-        if onset_output is not None:
-            onset_output = onset_output[trim_frames:-trim_frames or None]
-        note_parts.append(note_output.astype(np.float64, copy=False))
-        if onset_output is not None:
-            # Read the onset at the frame's winning note bin.  Taking the
-            # maximum over all 88 bins would include accompaniment/harmonic
-            # onset spikes that have nothing to do with the vocal contour.
-            winning_bins = np.argmax(note_output, axis=1)
-            onset_parts.append(
-                onset_output[
-                    np.arange(len(onset_output)), winning_bins
-                ].astype(np.float32, copy=False)
+    with _basic_pitch_session(model_path) as session:
+        input_name = session.get_inputs()[0].name
+        note_parts: list[np.ndarray] = []
+        onset_parts: list[np.ndarray] = []
+        time_parts: list[np.ndarray] = []
+        for start in range(0, len(padded), window_hop_samples):
+            window = padded[start : start + BASIC_PITCH_INPUT_SAMPLES]
+            if len(window) < BASIC_PITCH_INPUT_SAMPLES:
+                window = np.pad(window, (0, BASIC_PITCH_INPUT_SAMPLES - len(window)))
+            outputs = session.run(None, {input_name: window.astype(np.float32)[None, :, None]})
+            # The ONNX export orders outputs as onset, note, contour.  Resolve by
+            # shape rather than relying on that order in case a future export
+            # reorders the graph outputs.
+            output_infos = session.get_outputs()
+            note_output = next(
+                (
+                    np.asarray(output)[0]
+                    for info, output in zip(output_infos, outputs)
+                    if info.name.endswith(":1")
+                    and np.asarray(output).ndim == 3
+                    and np.asarray(output).shape[-1] == 88
+                ),
+                None,
             )
-        window_start_s = (
-            start - overlap_samples // 2
-        ) / float(BASIC_PITCH_SAMPLE_RATE)
-        time_parts.append(
-            window_start_s
-            + (
-                trim_frames + np.arange(len(note_output))
+            if note_output is None:
+                # Older exports do not preserve TensorFlow's output names.  In
+                # that case the second 88-bin output is the note activation; the
+                # first is the onset activation and the 264-bin output is the
+                # fine contour.
+                note_candidates = [
+                    np.asarray(output)[0]
+                    for output in outputs
+                    if np.asarray(output).ndim == 3
+                    and np.asarray(output).shape[-1] == 88
+                ]
+                if len(note_candidates) == 2:
+                    note_output = note_candidates[1]
+            if note_output is None:
+                raise RuntimeError("Basic Pitch ONNX output has no 88-bin note activation")
+            onset_output = next(
+                (
+                    np.asarray(output)[0]
+                    for info, output in zip(output_infos, outputs)
+                    if info.name.endswith(":2")
+                    and np.asarray(output).ndim == 3
+                    and np.asarray(output).shape[-1] == 88
+                ),
+                None,
             )
-            * BASIC_PITCH_FRAME_HOP_S
-        )
-        del outputs, note_output, window
+            if onset_output is None:
+                onset_candidates = [
+                    np.asarray(output)[0]
+                    for output in outputs
+                    if np.asarray(output).ndim == 3
+                    and np.asarray(output).shape[-1] == 88
+                ]
+                if len(onset_candidates) == 2:
+                    onset_output = onset_candidates[0]
+            note_output = note_output[trim_frames:-trim_frames or None]
+            if onset_output is not None:
+                onset_output = onset_output[trim_frames:-trim_frames or None]
+            note_parts.append(note_output.astype(np.float64, copy=False))
+            if onset_output is not None:
+                # Read the onset at the frame's winning note bin.  Taking the
+                # maximum over all 88 bins would include accompaniment/harmonic
+                # onset spikes that have nothing to do with the vocal contour.
+                winning_bins = np.argmax(note_output, axis=1)
+                onset_parts.append(
+                    onset_output[
+                        np.arange(len(onset_output)), winning_bins
+                    ].astype(np.float32, copy=False)
+                )
+            window_start_s = (
+                start - overlap_samples // 2
+            ) / float(BASIC_PITCH_SAMPLE_RATE)
+            time_parts.append(
+                window_start_s
+                + (
+                    trim_frames + np.arange(len(note_output))
+                )
+                * BASIC_PITCH_FRAME_HOP_S
+            )
+            del outputs, note_output, window
     notes = np.concatenate(note_parts, axis=0)
     onset_scores = np.concatenate(onset_parts, axis=0) if onset_parts else None
     times = np.concatenate(time_parts, axis=0)
@@ -1307,6 +1285,13 @@ def _detect_basic_pitch_melodia(
     )
 
 
+def _run_pyin(samples: np.ndarray, frame_length: int):
+    from processing.native_pitch import native_pyin
+    from processing.rust_utility import executable_path
+
+    return native_pyin(executable_path(), samples, frame_length, HOP_LENGTH)
+
+
 def detect_pitch(
     vocals_path: str,
     accompaniment_path: str | None = None,
@@ -1576,13 +1561,7 @@ def detect_pitch(
     y, sr = librosa.load(vocals_path, sr=22050, mono=True)
     log.info("Running pyin on %d samples (sr=%d, duration=%.1fs)", len(y), sr, len(y) / sr)
 
-    f0, voiced_flag, voiced_prob = librosa.pyin(
-        y, sr=sr,
-        fmin=librosa.note_to_hz("C2"),
-        fmax=librosa.note_to_hz("C6"),
-        frame_length=FRAME_LENGTH,
-        hop_length=HOP_LENGTH,
-    )
+    f0, voiced_flag, voiced_prob = _run_pyin(y, FRAME_LENGTH)
     selected_frame_length = FRAME_LENGTH
     voiced_values = np.nan_to_num(f0, nan=0.0)
     confidence_values = np.asarray(voiced_prob, dtype=np.float64)
@@ -1606,13 +1585,7 @@ def detect_pitch(
         # fallback sequentially so the temporary base contour can be freed
         # before the longer pYIN pass allocates its working buffers.
         del f0, voiced_flag, voiced_prob
-        f0, voiced_flag, voiced_prob = librosa.pyin(
-            y, sr=sr,
-            fmin=librosa.note_to_hz("C2"),
-            fmax=librosa.note_to_hz("C6"),
-            frame_length=LONG_FRAME_LENGTH,
-            hop_length=HOP_LENGTH,
-        )
+        f0, voiced_flag, voiced_prob = _run_pyin(y, LONG_FRAME_LENGTH)
         selected_frame_length = LONG_FRAME_LENGTH
     # ``pyin`` centers its analysis windows by default. Include the half-window
     # offset so word spans sample the pitch frame that actually covers them;

@@ -1,0 +1,8 @@
+[package]
+name = "karaoke-pyin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+pyin = "1.2"

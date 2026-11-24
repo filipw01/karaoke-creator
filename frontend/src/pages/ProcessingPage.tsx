@@ -11,6 +11,7 @@ export const ProcessingPage = () => {
   const [message, setMessage] = createSignal("Starting processing...")
   const [progress, setProgress] = createSignal(0)
   const [error, setError] = createSignal("")
+  const [failedPhase, setFailedPhase] = createSignal("")
   const [retrying, setRetrying] = createSignal(false)
   const [retryAttempt, setRetryAttempt] = createSignal(0)
 
@@ -22,6 +23,7 @@ export const ProcessingPage = () => {
       setMessage("Starting processing...")
       setProgress(0)
       setError("")
+      setFailedPhase("")
       setRetrying(false)
     }
     let cancelled = false
@@ -36,6 +38,11 @@ export const ProcessingPage = () => {
         setStatus(data.status)
         setMessage(data.message || "Processing...")
         setProgress(data.progress_percent ?? 0)
+        if (data.metadata) {
+          setTitle(data.metadata.title || "Processing song")
+          setArtist(data.metadata.artist)
+        }
+        setFailedPhase(data.failed_phase ?? "")
 
         if (data.status === "pending" && !startAttempted) {
           startAttempted = true
@@ -114,7 +121,7 @@ export const ProcessingPage = () => {
               disabled={retrying()}
               class="mt-5 rounded-lg bg-violet-600 px-4 py-2 text-sm text-white hover:bg-violet-500 disabled:opacity-50"
             >
-              {retrying() ? "Retrying..." : "Try again from last successful step"}
+              {retrying() ? "Retrying..." : failedPhase() === "publish" ? "Retry publish" : "Try again from last successful step"}
             </button>
             <button
               type="button"

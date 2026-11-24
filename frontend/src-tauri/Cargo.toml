@@ -21,12 +21,36 @@ tauri-build = { version = "2.7.6", features = [] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "api-24", "load-dynamic"] }
+karaoke-pyin = { path = "pitch-tracker" }
 dunce = "1"
 encoding_rs = "0.8"
 hex = "0.4"
+hound = "3.5"
 regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
 sha2 = "0.11"
 tempfile = "3"
+uuid = { version = "1", features = ["v4", "serde"] }
+wait-timeout = "0.2"
+zip = { version = "4.6", default-features = false, features = ["deflate"] }
 tauri = { version = "2.12.7", features = ["protocol-asset"] }
 tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"
+
+# Optimize the generic pYIN code where it is instantiated while keeping the
+# Tauri app's incremental watch builds unoptimized.
+[profile.dev.package.karaoke-pyin]
+opt-level = 2
+
+[profile.dev.package.pyin]
+opt-level = 2
+
+[profile.dev.package."ndarray:0.15.6"]
+opt-level = 2
+
+[profile.dev.package.ndarray-stats]
+opt-level = 2
+
+[profile.dev.package.noisy_float]
+opt-level = 2

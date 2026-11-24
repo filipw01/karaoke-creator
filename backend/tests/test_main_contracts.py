@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import subprocess
 import sys
+import uuid
 import wave
 from pathlib import Path
 
@@ -38,8 +40,9 @@ from processing.metadata import clean_music_title
 
 
 @pytest.fixture(autouse=True)
-def prevent_contract_tests_from_persisting_jobs(monkeypatch: pytest.MonkeyPatch):
+def isolate_contract_test_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(main, "_persist_jobs", lambda: None)
+    monkeypatch.setattr(main, "WORKING_DIRECTORY_FILE", str(tmp_path / "working-directory.json"))
 
 
 def test_clean_music_title_removes_video_noise():
@@ -622,11 +625,19 @@ def test_phase1_pauses_for_lyrics_review(tmp_path: Path, monkeypatch: pytest.Mon
     main.jobs[job.id] = job
     scheduled: list[object] = []
 
-    monkeypatch.setattr("processing.audio.extract_audio", lambda *_: str(audio_path))
-    monkeypatch.setattr("processing.audio.is_video_file", lambda *_: False)
-    monkeypatch.setattr("processing.vocals.separate_vocals", lambda *_: (str(vocals_path), str(instrumental_path)))
-    monkeypatch.setattr("processing.bpm.detect_bpm", lambda *_: 120.0)
-    monkeypatch.setattr("processing.lyrics_search.search_lyrics", lambda *_: "online lyrics")
+    async def prepare(operation, progress, **arguments):
+        assert operation == "prepare_browser_media"
+        assert arguments["media"]["source"] == str(input_path)
+        progress({"status": "separating_vocals", "message": "Separating"})
+        assert job.status == JobStatus.SEPARATING_VOCALS
+        return {
+            "audio_path": str(audio_path), "vocals_path": str(vocals_path),
+            "instrumental_path": str(instrumental_path), "real_bpm": 120.0,
+            "found_lyrics": "online lyrics", "has_video": False,
+            "metadata": {"genre": "", "year": ""},
+        }
+
+    monkeypatch.setattr(main, "call_with_progress", prepare)
     monkeypatch.setattr(asyncio, "create_task", lambda coroutine: scheduled.append(coroutine))
 
     asyncio.run(main._process_phase1(job))
@@ -635,6 +646,92 @@ def test_phase1_pauses_for_lyrics_review(tmp_path: Path, monkeypatch: pytest.Mon
     assert job.found_lyrics == "online lyrics"
     assert job.lyric_revisions == []
     assert scheduled == []
+
+
+def test_desktop_import_adopts_completed_rust_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import_id = uuid.uuid4()
+    uploads = tmp_path / "uploads"
+    outputs = tmp_path / "outputs"
+    staged_upload = uploads / str(import_id)
+    staged_output = outputs / str(import_id)
+    staged_upload.mkdir(parents=True)
+    staged_output.mkdir(parents=True)
+    (staged_upload / "input").write_bytes(b"original media")
+    (staged_upload / "prepared-media.json").write_text(
+        json.dumps({"original_filename": "A Song.mp4", "has_video": True}),
+        encoding="utf-8",
+    )
+    audio_path = staged_output / "audio.wav"
+    with wave.open(str(audio_path), "wb") as audio:
+        audio.setparams((2, 2, 44100, 0, "NONE", "not compressed"))
+        audio.writeframes(b"\x00" * 4)
+
+    monkeypatch.setattr(main, "UPLOAD_DIR", str(uploads))
+    monkeypatch.setattr(main, "OUTPUT_DIR", str(outputs))
+    monkeypatch.setattr(main, "jobs", {})
+    local = Request({"type": "http", "client": ("127.0.0.1", 8000), "headers": []})
+    body = main.PreparedMediaImport(import_id=import_id, genre="Rock", year="2024")
+    with pytest.raises(HTTPException) as incomplete:
+        asyncio.run(main.register_prepared_media(local, body))
+    assert incomplete.value.status_code == 404
+
+    for name in ("vocals.wav", "instrumental.wav"):
+        shutil.copyfile(audio_path, staged_output / name)
+    (staged_upload / "desktop-preparation.json").write_text(
+        json.dumps({"status": "awaiting_lyrics", "real_bpm": 123.0, "found_lyrics": "approved later"}),
+        encoding="utf-8",
+    )
+    registered = asyncio.run(main.register_prepared_media(local, body))
+    assert registered == {"job_id": str(import_id)}
+    assert asyncio.run(main.register_prepared_media(local, body)) == registered
+    job = main.jobs[str(import_id)]
+    assert job.status == JobStatus.AWAITING_LYRICS
+    assert job.metadata.title == "A Song"
+    assert job.has_video
+    assert job.real_bpm == 123.0
+    assert job.found_lyrics == "approved later"
+    assert Path(job.audio_path) == audio_path.resolve()
+    assert Path(job.vocals_path) == (staged_output / "vocals.wav").resolve()
+
+    different_owner = Request({"type": "http", "client": ("127.0.0.1", 8000), "headers": []})
+    different_owner.state.owner_id = "other"
+    with pytest.raises(HTTPException) as forbidden:
+        asyncio.run(main.register_prepared_media(different_owner, body))
+    assert forbidden.value.status_code == 404
+
+
+def test_desktop_import_rejects_missing_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(main, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setattr(main, "OUTPUT_DIR", str(tmp_path / "outputs"))
+    monkeypatch.setattr(main, "jobs", {})
+    local = Request({"type": "http", "client": ("127.0.0.1", 8000), "headers": []})
+    with pytest.raises(HTTPException) as missing:
+        asyncio.run(main.register_prepared_media(local, main.PreparedMediaImport(import_id=uuid.uuid4())))
+    assert missing.value.status_code == 404
+    assert main.jobs == {}
+
+
+def test_retry_publish_uses_the_finished_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    job = _job(tmp_path)
+    job.status = JobStatus.ERROR
+    job.failed_phase = "publish"
+    job.error = "Permission denied"
+    result = job.result
+    monkeypatch.setattr(main, "jobs", {job.id: job})
+    published = []
+    monkeypatch.setattr(main, "_publish_song_to_library", lambda saved: published.append(saved.result))
+    scheduled = []
+    monkeypatch.setattr(asyncio, "create_task", lambda coroutine: scheduled.append(coroutine))
+
+    assert asyncio.run(main.retry_job(job.id)) == {"status": "retrying", "phase": "publish"}
+    assert job.status == JobStatus.GENERATING
+    assert len(scheduled) == 1
+    asyncio.run(scheduled.pop())
+    assert job.status == JobStatus.DONE
+    assert job.result is result
+    assert published == [result]
 
 
 def test_confirm_lyrics_creates_revision_and_resumes_phase2(monkeypatch: pytest.MonkeyPatch):
@@ -713,14 +810,30 @@ def test_retry_phase1_reuses_existing_audio_and_starts_background(monkeypatch: p
     scheduled[0].close()
 
 
-def test_youtube_download_options_enable_js_challenge_solver(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("KARAOKE_YTDLP_NODE_PATH", "/usr/local/bin/node")
+def test_browser_youtube_adopts_prepared_rust_media(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    job = Job(id="job", status=JobStatus.DOWNLOADING)
+    monkeypatch.setattr(main, "jobs", {job.id: job})
+    request = main.YouTubeDownloadRequest(
+        url="https://www.youtube.com/watch?v=example", title="", artist="Chosen artist",
+        language="en", genre="", year="",
+    )
 
-    options = main._youtube_download_options(str(tmp_path), lambda _: None)
+    async def download(operation, progress, **arguments):
+        assert operation == "download_youtube"
+        assert arguments["url"] == request.url
+        assert arguments["job_id"] == job.id
+        progress({"progress_percent": 55.0})
+        assert job.progress_percent == 55.0
+        return {
+            "original_filename": "Song.mp4", "title": "Song", "artist": "Artist", "has_video": True,
+            "upload_path": str(tmp_path / "input"), "audio_path": str(tmp_path / "audio.wav"),
+            "work_dir": str(tmp_path),
+        }
 
-    assert options["js_runtimes"] == {"node": {"path": "/usr/local/bin/node"}}
-    assert options["remote_components"] == ["ejs:github"]
-    assert options["cachedir"] == main.YTDLP_CACHE_DIR
-    assert options["outtmpl"] == str(tmp_path / "%(title)s.%(ext)s")
-    assert options["retries"] >= 1
-    assert options["fragment_retries"] >= 1
+    monkeypatch.setattr(main, "call_with_progress", download)
+    asyncio.run(main._download_youtube_video(job.id, request))
+
+    assert job.status == JobStatus.PENDING
+    assert job.has_video and job.audio_path == str(tmp_path / "audio.wav")
+    assert job.metadata.title == "Song"
+    assert job.metadata.artist == "Chosen artist"

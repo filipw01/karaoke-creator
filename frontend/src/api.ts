@@ -26,10 +26,35 @@ const invokeDesktop = async <T>(command: string, args?: Record<string, unknown>)
   }
 }
 
-export const uploadFile = async (
-  file: File,
-  metadata: { title: string; artist: string; language: string; genre: string; year: string },
-): Promise<string> => {
+type ImportMetadata = { title: string; artist: string; language: string; genre: string; year: string }
+
+export interface LocalMedia {
+  path: string
+  name: string
+  size: number
+}
+
+export const pickLocalMedia = () => invokeDesktop<LocalMedia | null>("pick_local_media")
+export const inspectLocalMedia = (path: string) => invokeDesktop<LocalMedia>("inspect_local_media", { path })
+export const prepareLocalMedia = (path: string) => invokeDesktop<string>("prepare_local_media", { path })
+
+export const registerLocalMedia = (importId: string, metadata: ImportMetadata) =>
+  invokeDesktop<string>("register_native_media", { importId, metadata })
+
+const handOffLocalMedia = async (importId: string, metadata: ImportMetadata): Promise<void> => {
+  const res = await fetch(`${BASE}/desktop/import`, {
+    method: "POST",
+    headers: apiHeaders(true),
+    body: JSON.stringify({ import_id: importId, ...metadata }),
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}))
+    throw new Error(typeof error.detail === "string" ? error.detail : "Failed to register prepared media")
+  }
+  await invokeDesktop("retire_native_job", { jobId: importId })
+}
+
+export const uploadFile = async (file: File, metadata: ImportMetadata): Promise<string> => {
   const form = new FormData()
   form.append("file", file)
   form.append("title", metadata.title)
@@ -48,6 +73,7 @@ export const uploadFile = async (
 }
 
 export const startProcessing = async (jobId: string): Promise<void> => {
+  if (isTauri() && await invokeDesktop<boolean>("start_native_job", { jobId, retry: false })) return
   const res = await fetch(`${BASE}/process/${jobId}/start`, { method: "POST", headers: apiHeaders() })
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: "Failed to start processing" }))
@@ -101,6 +127,12 @@ export const getAudioUrl = (
 export const getDownloadUrl = (jobId: string): string =>
   `${BASE}/jobs/${jobId}/download${authQuery}`
 
+export const saveManagedZip = async (jobId: string): Promise<void> => {
+  const chart = await getResult(jobId)
+  if (!chart.export_ready) throw new Error("The selected lyric revision has no completed alignment to export")
+  await invokeDesktop("save_managed_zip", { jobId, chart })
+}
+
 export interface LyricsSearchResult {
   track_name: string
   artist_name: string
@@ -111,6 +143,10 @@ export interface LyricsSearchResult {
 }
 
 export const confirmLyrics = async (jobId: string, lyrics: string): Promise<void> => {
+  if (isTauri()) {
+    const native = await invokeDesktop<{ metadata: ImportMetadata } | null>("native_job_status", { jobId })
+    if (native) await handOffLocalMedia(jobId, native.metadata)
+  }
   const res = await fetch(`${BASE}/jobs/${jobId}/confirm-lyrics`, {
     method: "POST",
     headers: apiHeaders(true),
@@ -124,6 +160,7 @@ export const confirmLyrics = async (jobId: string, lyrics: string): Promise<void
 
 export const searchLyricsOnline = async (query: string): Promise<Array<LyricsSearchResult>> => {
   if (!query.trim()) return []
+  if (isTauri()) return invokeDesktop("search_local_lyrics", { query })
   const res = await fetch(`${BASE}/lyrics/search?${new URLSearchParams({ q: query.trim() })}`, {
     headers: apiHeaders(),
   })
@@ -231,6 +268,7 @@ export interface ParsedFilename {
 }
 
 export const parseFilename = async (filename: string): Promise<ParsedFilename> => {
+  if (isTauri()) return invokeDesktop("parse_local_filename", { filename })
   const res = await fetch(`${BASE}/parse-filename`, {
     method: "POST",
     headers: apiHeaders(true),
@@ -285,9 +323,10 @@ const listManagedSongs = async (): Promise<ManagedLibrary> => {
 
 export const listSongs = async (): Promise<SongLibrary> => {
   if (!isTauri()) return listHttpSongs()
-  const [nativeLibrary, managed] = await Promise.all([
+  const [nativeLibrary, managed, nativeJobs] = await Promise.all([
     invokeDesktop<SongLibrary>("list_native_songs"),
     import.meta.env.DEV ? listManagedSongs().catch(() => undefined) : undefined,
+    invokeDesktop<SongListItem[]>("list_native_jobs"),
   ])
   let library = nativeLibrary
   if (!library.working_directory && managed?.working_directory) {
@@ -300,9 +339,14 @@ export const listSongs = async (): Promise<SongLibrary> => {
   }
   sharedDevelopmentLibrary = !!library.working_directory && library.working_directory === managed?.working_directory
   const published = new Set(sharedDevelopmentLibrary ? managed?.published_paths : [])
+  const serverJobs = new Set(managed?.songs.map((song) => song.id))
   return {
     working_directory: library.working_directory,
-    songs: [...(managed?.songs ?? []), ...library.songs.filter((song) => !published.has(song.path ?? ""))],
+    songs: [
+      ...nativeJobs.filter((song) => !serverJobs.has(song.id)),
+      ...(managed?.songs ?? []),
+      ...library.songs.filter((song) => !published.has(song.path ?? "")),
+    ],
   }
 }
 
@@ -456,6 +500,8 @@ export const removeSong = async (song: SongListItem): Promise<void> => {
   if (song.kind === "external" && isTauri()) {
     return invokeDesktop("remove_external_chart", { path: song.path })
   }
+  if (song.kind === "managed" && isTauri() &&
+    await invokeDesktop<boolean>("remove_native_job", { jobId: song.id })) return
   const query = song.kind === "managed"
     ? new URLSearchParams({ job_id: song.id })
     : new URLSearchParams({ path: song.path ?? "" })
@@ -479,9 +525,16 @@ export const getStatus = async (
   found_lyrics?: string
   progress_percent?: number
   lyric_revision_id?: string
+  failed_phase?: string
   alignment_comparison_status?: string | null
   alignment_run?: AlignmentRun
 }> => {
+  if (isTauri()) {
+    const native = await invokeDesktop<{ status: string; message: string; found_lyrics?: string } | null>(
+      "native_job_status", { jobId },
+    )
+    if (native) return native
+  }
   const res = await fetch(`${BASE}/jobs/${jobId}/status`, { headers: apiHeaders() })
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: "Failed to get job status" }))
@@ -491,6 +544,7 @@ export const getStatus = async (
 }
 
 export const retryJob = async (jobId: string): Promise<void> => {
+  if (isTauri() && await invokeDesktop<boolean>("start_native_job", { jobId, retry: true })) return
   const res = await fetch(`${BASE}/jobs/${jobId}/retry`, { method: "POST", headers: apiHeaders() })
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: "Failed to retry processing" }))
@@ -509,6 +563,7 @@ export interface YouTubeSearchResult {
 
 export const searchYouTube = async (query: string): Promise<Array<YouTubeSearchResult>> => {
   if (!query.trim()) return []
+  if (isTauri()) return invokeDesktop("search_local_youtube", { query })
   const res = await fetch(`${BASE}/youtube/search`, {
     method: "POST",
     headers: apiHeaders(true),
@@ -523,6 +578,7 @@ export const downloadYouTube = async (
   url: string,
   metadata: { title: string; artist: string; language: string; genre: string; year: string },
 ): Promise<string> => {
+  if (isTauri()) return invokeDesktop("register_native_download", { url, metadata })
   const res = await fetch(`${BASE}/youtube/download`, {
     method: "POST",
     headers: apiHeaders(true),

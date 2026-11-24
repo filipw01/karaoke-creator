@@ -2,7 +2,6 @@ use std::{
     fs::{self, File},
     io::{self, BufRead, BufReader, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
     time::UNIX_EPOCH,
 };
 
@@ -11,7 +10,10 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::external_chart::{self, Metadata, Phrase};
+use crate::{
+    external_chart::{self, Metadata, Phrase},
+    media::write_pcm_wav,
+};
 
 pub(crate) struct Library {
     settings_file: PathBuf,
@@ -90,33 +92,7 @@ impl Library {
     }
 
     fn list(&self) -> Result<SongList, String> {
-        let working_directory = self.directory()?;
-        let mut songs = Vec::new();
-        if let Some(root) = working_directory.as_ref().filter(|root| root.is_dir()) {
-            let mut directories = vec![root.clone()];
-            while let Some(directory) = directories.pop() {
-                let Ok(entries) = fs::read_dir(directory) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    let Ok(file_type) = entry.file_type() else {
-                        continue;
-                    };
-                    if file_type.is_dir() {
-                        directories.push(entry.path());
-                    } else if file_type.is_file() && is_chart(&entry.path()) {
-                        if let Some(song) = list_item(root, &entry.path()) {
-                            songs.push(song);
-                        }
-                    }
-                }
-            }
-        }
-        songs.sort_by_cached_key(|song| (song.title.to_lowercase(), song.artist.to_lowercase()));
-        Ok(SongList {
-            working_directory,
-            songs,
-        })
+        Ok(scan_songs(self.directory()?))
     }
 
     fn chart_path(&self, path: &str) -> Result<(PathBuf, PathBuf), String> {
@@ -161,23 +137,63 @@ impl Library {
 
     fn save_chart(&self, path: &str, phrases: &[Phrase]) -> Result<String, String> {
         let (_, chart) = self.chart_path(path)?;
-        let content = read_chart(&chart)?;
-        let parsed = external_chart::parse(&content, chart_stem(&chart))?;
-        let updated = external_chart::update(&content, &parsed, phrases)?;
-        write_atomically(&chart, updated.as_bytes())
-            .map_err(|error| format!("Failed to save existing song chart: {error}"))?;
-        Ok(updated)
+        save_chart_file(&chart, phrases)
     }
 
     fn remove_chart(&self, path: &str) -> Result<(), String> {
         let (root, chart) = self.chart_path(path)?;
-        let parent = chart.parent().ok_or("Song not found")?;
-        let result = if parent == root {
-            fs::remove_file(chart)
-        } else {
-            fs::remove_dir_all(parent)
-        };
-        result.map_err(|error| format!("Unable to remove song: {error}"))
+        remove_chart_file(&root, &chart)
+    }
+}
+
+pub(crate) fn remove_chart_file(root: &Path, chart: &Path) -> Result<(), String> {
+    let parent = chart
+        .parent()
+        .filter(|path| path.starts_with(root))
+        .ok_or("Song not found")?;
+    let result = if parent == root {
+        fs::remove_file(chart)
+    } else {
+        fs::remove_dir_all(parent)
+    };
+    result.map_err(|error| format!("Unable to remove song: {error}"))
+}
+
+pub(crate) fn save_chart_file(chart: &Path, phrases: &[Phrase]) -> Result<String, String> {
+    let content = read_chart(chart)?;
+    let parsed = external_chart::parse(&content, chart_stem(chart))?;
+    let updated = external_chart::update(&content, &parsed, phrases)?;
+    write_atomically(chart, updated.as_bytes())
+        .map_err(|error| format!("Failed to save existing song chart: {error}"))?;
+    Ok(updated)
+}
+
+pub(crate) fn scan_songs(working_directory: Option<PathBuf>) -> SongList {
+    let mut songs = Vec::new();
+    if let Some(root) = working_directory.as_ref().filter(|root| root.is_dir()) {
+        let mut directories = vec![root.clone()];
+        while let Some(directory) = directories.pop() {
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    directories.push(entry.path());
+                } else if file_type.is_file() && is_chart(&entry.path()) {
+                    if let Some(song) = list_item(root, &entry.path()) {
+                        songs.push(song);
+                    }
+                }
+            }
+        }
+    }
+    songs.sort_by_cached_key(|song| (song.title.to_lowercase(), song.artist.to_lowercase()));
+    SongList {
+        working_directory,
+        songs,
     }
 }
 
@@ -233,20 +249,20 @@ fn list_item(root: &Path, chart: &Path) -> Option<SongListItem> {
     })
 }
 
-fn read_chart(path: &Path) -> Result<String, String> {
+pub(crate) fn read_chart(path: &Path) -> Result<String, String> {
     fs::read(path)
         .map(|bytes| external_chart::decode(&bytes))
         .map_err(|error| format!("Song file is unavailable: {error}"))
 }
 
-fn resolve_audio(root: &Path, chart: &Path, content: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_audio(root: &Path, chart: &Path, content: &str) -> Option<PathBuf> {
     let headers = external_chart::headers(content);
     let reference = external_chart::audio_reference(&headers)?;
     let source = dunce::canonicalize(chart.parent()?.join(reference)).ok()?;
     (source.starts_with(root) && source.is_file()).then_some(source)
 }
 
-fn playback_path(source: &Path, cache: &Path) -> PathBuf {
+pub(crate) fn playback_path(source: &Path, cache: &Path) -> PathBuf {
     let is_mp3 = source
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("mp3"));
@@ -276,32 +292,12 @@ fn cache_pcm(source: &Path, cache: &Path) -> io::Result<PathBuf> {
 
     fs::create_dir_all(cache)?;
     let temporary = tempfile::NamedTempFile::new_in(cache)?;
-    let status = Command::new("ffmpeg")
-        .args(["-nostdin", "-loglevel", "error", "-y", "-i"])
-        .arg(source)
-        .args([
-            "-vn",
-            "-c:a",
-            "pcm_s16le",
-            "-ar",
-            "44100",
-            "-ac",
-            "2",
-            "-f",
-            "wav",
-        ])
-        .arg(temporary.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if !status.success() {
-        return Err(io::Error::other(format!("FFmpeg exited with {status}")));
-    }
+    write_pcm_wav(source, temporary.path())?;
     temporary.persist(&path)?;
     dunce::canonicalize(path)
 }
 
-fn write_atomically(destination: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomically(destination: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = destination
         .parent()
         .ok_or_else(|| io::Error::other("Missing parent folder"))?;

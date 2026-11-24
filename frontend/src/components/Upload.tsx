@@ -1,5 +1,11 @@
-import { createEffect, createSignal } from "solid-js"
-import { uploadFile, parseFilename, searchYouTube, downloadYouTube, getStatus, type YouTubeSearchResult } from "../api"
+import { createEffect, createSignal, onCleanup } from "solid-js"
+import { isTauri } from "@tauri-apps/api/core"
+import { getCurrentWebview } from "@tauri-apps/api/webview"
+import {
+  uploadFile, parseFilename, searchYouTube, downloadYouTube, getStatus,
+  pickLocalMedia, inspectLocalMedia, prepareLocalMedia, registerLocalMedia,
+  type LocalMedia, type YouTubeSearchResult,
+} from "../api"
 
 interface UploadProps {
   onUploaded: (jobId: string, meta?: { artist: string; title: string }) => void
@@ -11,7 +17,8 @@ const ACCEPTED_TYPES = [
 ]
 
 export const Upload = ({ onUploaded }: UploadProps) => {
-  const [file, setFile] = createSignal<File | null>(null)
+  const desktop = isTauri()
+  const [file, setFile] = createSignal<File | LocalMedia | null>(null)
   const [title, setTitle] = createSignal("")
   const [artist, setArtist] = createSignal("")
   const [language, setLanguage] = createSignal<"en" | "pl">("en")
@@ -30,18 +37,22 @@ export const Upload = ({ onUploaded }: UploadProps) => {
   const [downloadPercent, setDownloadPercent] = createSignal(0)
   const [downloadJobId, setDownloadJobId] = createSignal<string | null>(null)
   let inputRef: HTMLInputElement | undefined
+  let preparedImport: { selection: LocalMedia; id: string } | undefined
 
-  const handleFile = (f: File) => {
+  const handleFile = (f: File | LocalMedia) => {
+    preparedImport = undefined
     setFile(f)
     setError("")
     setParsing(true)
     parseFilename(f.name)
       .then((meta) => {
+        if (file() !== f) return
         if (meta.title) setTitle(meta.title)
         if (meta.artist) setArtist(meta.artist)
         if (meta.language) setLanguage(meta.language.toLowerCase().startsWith("pl") || meta.language.toLowerCase().startsWith("pol") ? "pl" : "en")
       })
       .catch(() => {
+        if (file() !== f) return
         // Fallback: simple split on " - "
         const name = f.name.replace(/\.[^.]+$/, "")
         const parts = name.split(" - ")
@@ -52,14 +63,49 @@ export const Upload = ({ onUploaded }: UploadProps) => {
           setTitle(name)
         }
       })
-      .finally(() => setParsing(false))
+      .finally(() => {
+        if (file() === f) setParsing(false)
+      })
+  }
+
+  const browseMedia = async () => {
+    if (uploading()) return
+    if (!desktop) {
+      inputRef?.click()
+      return
+    }
+    try {
+      const selected = await pickLocalMedia()
+      if (selected && !uploading() && !useYouTube()) handleFile(selected)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to open media file")
+    }
+  }
+
+  if (desktop) {
+    let disposed = false
+    const listener = getCurrentWebview().onDragDropEvent(async ({ payload }) => {
+      if (uploading() || useYouTube()) return
+      setDragOver(payload.type === "enter" || payload.type === "over")
+      if (payload.type !== "drop" || !payload.paths[0]) return
+      try {
+        const selected = await inspectLocalMedia(payload.paths[0])
+        if (!disposed && !uploading() && !useYouTube()) handleFile(selected)
+      } catch (err) {
+        if (!disposed) setError(err instanceof Error ? err.message : "Failed to open media file")
+      }
+    }).catch(() => undefined)
+    onCleanup(() => {
+      disposed = true
+      void listener.then((unlisten) => unlisten?.())
+    })
   }
 
   const handleDrop = (e: DragEvent) => {
     e.preventDefault()
     setDragOver(false)
     const f = e.dataTransfer?.files[0]
-    if (f) handleFile(f)
+    if (!desktop && f && !uploading()) handleFile(f)
   }
 
   const handleYouTubeSearch = async () => {
@@ -116,7 +162,7 @@ export const Upload = ({ onUploaded }: UploadProps) => {
           setDownloadPercent(data.progress_percent)
         }
         
-        if (data.status === "pending" || data.status === "extracting_audio") {
+        if (["pending", "extracting_audio", "separating_vocals", "detecting_bpm", "searching_lyrics", "awaiting_lyrics"].includes(data.status)) {
           // Download complete, move to processing
           setDownloading(false)
           setDownloadProgress("")
@@ -150,6 +196,7 @@ export const Upload = ({ onUploaded }: UploadProps) => {
 
   const handleSubmit = async (e: SubmitEvent) => {
     e.preventDefault()
+    if (uploading() || downloading()) return
     
     if (useYouTube()) {
       if (!selectedVideo()) {
@@ -174,14 +221,24 @@ export const Upload = ({ onUploaded }: UploadProps) => {
         setDownloadJobId(null)
       }
     } else {
-      if (!file()) return
+      const selection = file()
+      if (!selection) return
 
       setUploading(true)
       setError("")
 
       try {
-        const jobId = await uploadFile(file()!, { title: title(), artist: artist(), language: language(), genre: "", year: "" })
-        onUploaded(jobId, { artist: artist(), title: title() })
+        const metadata = { title: title(), artist: artist(), language: language(), genre: "", year: "" }
+        let jobId: string
+        if (selection instanceof File) {
+          jobId = await uploadFile(selection, metadata)
+        } else {
+          if (preparedImport?.selection !== selection) {
+            preparedImport = { selection, id: await prepareLocalMedia(selection.path) }
+          }
+          jobId = await registerLocalMedia(preparedImport.id, metadata)
+        }
+        onUploaded(jobId, { artist: metadata.artist, title: metadata.title })
       } catch (err) {
         setError(err instanceof Error ? err.message : "Upload failed")
         setUploading(false)
@@ -210,6 +267,7 @@ export const Upload = ({ onUploaded }: UploadProps) => {
         <div class="flex gap-2 border-b border-zinc-700 pb-4">
           <button
             type="button"
+            disabled={uploading() || downloading()}
             onClick={() => {
               setUseYouTube(false)
               setSelectedVideo(null)
@@ -225,9 +283,12 @@ export const Upload = ({ onUploaded }: UploadProps) => {
           </button>
           <button
             type="button"
+            disabled={uploading() || downloading()}
             onClick={() => {
               setUseYouTube(true)
               setFile(null)
+              preparedImport = undefined
+              setParsing(false)
             }}
             class={`px-4 py-2 rounded-lg transition-colors ${
               useYouTube()
@@ -356,7 +417,7 @@ export const Upload = ({ onUploaded }: UploadProps) => {
               onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
               onDragLeave={() => setDragOver(false)}
               onDrop={handleDrop}
-              onClick={() => inputRef?.click()}
+              onClick={() => void browseMedia()}
               class={`
                 border-2 border-dashed rounded-xl p-12 text-center cursor-pointer
                 transition-all duration-200
@@ -368,7 +429,7 @@ export const Upload = ({ onUploaded }: UploadProps) => {
                 }
               `}
             >
-              <input
+              {!desktop && <input
                 ref={(el) => { inputRef = el }}
                 type="file"
                 accept={ACCEPTED_TYPES.join(",")}
@@ -376,9 +437,9 @@ export const Upload = ({ onUploaded }: UploadProps) => {
                 data-testid="file-input"
                 onChange={(e) => {
                   const f = e.currentTarget.files?.[0]
-                  if (f) handleFile(f)
+                  if (f && !uploading()) handleFile(f)
                 }}
-              />
+              />}
               {file() ? (
                 <div>
                   <div class="text-emerald-400 text-lg font-medium mb-1">{file()!.name}</div>
@@ -481,7 +542,7 @@ export const Upload = ({ onUploaded }: UploadProps) => {
           {downloading()
             ? "Downloading..."
             : uploading()
-              ? "Uploading..."
+              ? desktop ? "Preparing audio..." : "Uploading..."
               : useYouTube()
                 ? "Download & Create Karaoke"
                 : "Upload & Create Karaoke"}

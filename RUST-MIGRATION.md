@@ -1,9 +1,11 @@
 # Moving the desktop backend to Rust
 
-The first desktop flow is implemented on `rust-desktop-migration`. Rust opens,
-plays, edits, and exports existing charts. The desktop library can run without
-Python in a release build. Managed job processing and stem separation still use
-FastAPI in development or the browser.
+Rust opens, plays, edits, and exports existing charts. In desktop
+development, it owns preparation through lyrics review. Browser and desktop
+share the Rust implementation for deterministic media, catalog, chart,
+publication, and ZIP operations. Rust now owns BPM, pYIN, and Basic Pitch
+execution. Python still owns post-approval state, Demucs, forced alignment,
+and the default ASR evidence pipeline.
 
 ## Recommendation
 
