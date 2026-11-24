@@ -20,7 +20,7 @@ use crate::{
 };
 
 #[derive(Deserialize)]
-struct Word {
+pub(crate) struct Word {
     text: String,
     start: f64,
     end: f64,
@@ -31,7 +31,7 @@ struct Word {
     alignment_status: String,
 }
 
-fn phrases(
+pub(crate) fn phrases(
     words: Vec<Word>,
     bpm: f64,
     gap_threshold: f64,
@@ -108,7 +108,7 @@ fn finish_phrase(phrases: &mut Vec<Phrase>, notes: &mut Vec<Note>, end_beat: Opt
     }
 }
 
-fn render(metadata: &Metadata, phrases: &[Phrase], assets: &Assets) -> String {
+pub(crate) fn render(metadata: &Metadata, phrases: &[Phrase], assets: &Assets) -> String {
     let mut chart = format!(
         "#TITLE:{}\n#ARTIST:{}\n#MP3:{}\n",
         metadata.title, metadata.artist, assets.audio_file
@@ -156,7 +156,7 @@ fn render(metadata: &Metadata, phrases: &[Phrase], assets: &Assets) -> String {
 }
 
 #[derive(Deserialize)]
-struct Assets {
+pub(crate) struct Assets {
     audio_file: String,
     #[serde(default)]
     vocals_file: String,
@@ -188,24 +188,28 @@ pub(crate) struct CompletedChart {
     assets: Assets,
 }
 
+pub(crate) fn chart_name(artist: &str, title: &str) -> String {
+    let name: String = format!("{artist} - {title}")
+        .chars()
+        .map(|part| {
+            if part.is_alphanumeric() || matches!(part, ' ' | '-' | '_' | '(' | ')') {
+                part
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = name.trim();
+    if name.is_empty() {
+        "song".into()
+    } else {
+        name.into()
+    }
+}
+
 impl CompletedChart {
-    fn name(&self) -> String {
-        let name: String = format!("{} - {}", self.metadata.artist, self.metadata.title)
-            .chars()
-            .map(|part| {
-                if part.is_alphanumeric() || matches!(part, ' ' | '-' | '_' | '(' | ')') {
-                    part
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let name = name.trim();
-        if name.is_empty() {
-            "song".into()
-        } else {
-            name.into()
-        }
+    pub(crate) fn name(&self) -> String {
+        chart_name(&self.metadata.artist, &self.metadata.title)
     }
 
     fn sources(&self, work: &Path) -> Result<Vec<(&str, PathBuf)>, String> {
@@ -231,7 +235,7 @@ impl CompletedChart {
             .collect()
     }
 
-    fn zip(&self, work: &Path, destination: &Path) -> Result<(), String> {
+    pub(crate) fn zip(&self, work: &Path, destination: &Path) -> Result<(), String> {
         let sources = self.sources(work)?;
         let parent = destination.parent().ok_or("Choose a ZIP destination")?;
         let mut temp =
@@ -262,7 +266,7 @@ impl CompletedChart {
         Ok(())
     }
 
-    fn publish(
+    pub(crate) fn publish(
         &self,
         job_id: &str,
         work: &Path,
@@ -354,38 +358,45 @@ fn recover_publication(root: &Path, name: &str, job_id: &str) -> Option<PathBuf>
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum Utility {
-    PrepareBrowserMedia {
+    UsesBasicPitchClock {
         backend: PathBuf,
-        media: crate::preparation::BrowserMedia,
     },
-    ParseFilename {
-        filename: String,
-    },
-    CleanTitle {
-        title: String,
-    },
-    SearchLyrics {
-        query: String,
-    },
-    SearchYoutube {
+    DetectPitch {
         backend: PathBuf,
-        query: String,
+        vocals: PathBuf,
+        accompaniment: Option<PathBuf>,
     },
-    DownloadYoutube {
-        backend: PathBuf,
-        job_id: Uuid,
+    DispatchWorkerAlignment {
+        request: Value,
         url: String,
+        token: Option<String>,
+        timeout: f64,
     },
     ExtractAudio {
         source: PathBuf,
         destination: PathBuf,
     },
-    PlaybackAudio {
+    NormalizeAudio {
         source: PathBuf,
-        cache: PathBuf,
+        destination: PathBuf,
     },
-    ScanLibrary {
-        directory: Option<PathBuf>,
+    PitchTextBoundaries {
+        texts: Vec<String>,
+    },
+    SegmentPitchWords {
+        request: crate::note_assignment::segments::SegmentRequest,
+    },
+    AssignPitchToWords {
+        request: crate::note_assignment::AssignmentRequest,
+    },
+    PitchKeyPrior {
+        beam: crate::note_assignment::candidates::Beam,
+    },
+    PitchCandidateEvidence {
+        beam: crate::note_assignment::candidates::Beam,
+        times: Vec<Option<f64>>,
+        spans: Vec<(f64, f64)>,
+        limit: usize,
     },
     ReadExternalChart {
         path: PathBuf,
@@ -398,23 +409,6 @@ enum Utility {
         content: String,
         phrases: Vec<Phrase>,
         pitch_offset: i64,
-    },
-    SaveExternalChart {
-        path: PathBuf,
-        phrases: Vec<Phrase>,
-    },
-    ExternalAudio {
-        root: PathBuf,
-        path: PathBuf,
-    },
-    RemoveExternalChart {
-        root: PathBuf,
-        path: PathBuf,
-    },
-    Archive {
-        chart: CompletedChart,
-        work: PathBuf,
-        destination: PathBuf,
     },
     Phrases {
         words: Vec<Word>,
@@ -436,40 +430,28 @@ enum Utility {
         destination: PathBuf,
         video: bool,
     },
-    Publish {
-        job_id: String,
-        chart: CompletedChart,
-        work: PathBuf,
-        library: PathBuf,
-        existing: Option<PathBuf>,
-    },
 }
 
-fn execute(request: Utility, mut progress: impl FnMut(Value)) -> Result<Value, String> {
+fn execute(request: Utility) -> Result<Value, String> {
     match request {
-        Utility::PrepareBrowserMedia { backend, media } => {
-            crate::preparation::prepare_browser_media(&backend, media, progress)
+        Utility::UsesBasicPitchClock { backend } => {
+            Ok(json!(crate::pitch_detection::basic_pitch_clock(&backend)))
         }
-        Utility::ParseFilename { filename } => Ok(crate::catalog::parse_local_filename(filename)),
-        Utility::CleanTitle { title } => Ok(json!(crate::catalog::clean_title(&title))),
-        Utility::SearchLyrics { query } => Ok(json!(crate::catalog::search(
-            &crate::catalog::client()?,
-            query.trim(),
-            20
-        ))),
-        Utility::SearchYoutube { backend, query } => {
-            Ok(json!(crate::youtube::search(&backend, &query)?))
-        }
-        Utility::DownloadYoutube {
+        Utility::DetectPitch {
             backend,
-            job_id,
-            url,
-        } => Ok(json!(crate::youtube::download(
+            vocals,
+            accompaniment,
+        } => Ok(json!(crate::pitch_detection::detect(
             &backend,
-            job_id,
-            &url,
-            |percent| progress(json!({"progress_percent": percent}))
+            &vocals,
+            accompaniment.as_deref()
         )?)),
+        Utility::DispatchWorkerAlignment {
+            request,
+            url,
+            token,
+            timeout,
+        } => crate::worker::dispatch(request, &url, token.as_deref(), timeout),
         Utility::ExtractAudio {
             source,
             destination,
@@ -485,10 +467,32 @@ fn execute(request: Utility, mut progress: impl FnMut(Value)) -> Result<Value, S
                 .map_err(|error| error.to_string())?;
             Ok(json!(destination))
         }
-        Utility::PlaybackAudio { source, cache } => {
-            Ok(json!(crate::library::playback_path(&source, &cache)))
+        Utility::NormalizeAudio {
+            source,
+            destination,
+        } => {
+            crate::media::normalize_audio(&source, &destination)?;
+            Ok(json!(destination))
         }
-        Utility::ScanLibrary { directory } => Ok(json!(crate::library::scan_songs(directory))),
+        Utility::PitchTextBoundaries { texts } => Ok(json!(
+            texts
+                .iter()
+                .map(|text| crate::note_assignment::lyrics::boundaries(text))
+                .collect::<Vec<_>>()
+        )),
+        Utility::SegmentPitchWords { request } => Ok(json!(request.resolve()?)),
+        Utility::AssignPitchToWords { request } => Ok(json!(request.resolve()?)),
+        Utility::PitchKeyPrior { beam } => {
+            Ok(json!(crate::note_assignment::candidates::key_prior(&beam)))
+        }
+        Utility::PitchCandidateEvidence {
+            beam,
+            times,
+            spans,
+            limit,
+        } => Ok(json!(
+            crate::note_assignment::candidates::evidence_for_spans(&beam, &times, &spans, limit)
+        )),
         Utility::ReadExternalChart { path } => Ok(json!(crate::library::read_chart(&path)?)),
         Utility::ParseExternalChart {
             content,
@@ -510,25 +514,6 @@ fn execute(request: Utility, mut progress: impl FnMut(Value)) -> Result<Value, S
             Ok(json!(crate::external_chart::update(
                 &content, &parsed, &phrases
             )?))
-        }
-        Utility::SaveExternalChart { path, phrases } => {
-            Ok(json!(crate::library::save_chart_file(&path, &phrases)?))
-        }
-        Utility::ExternalAudio { root, path } => {
-            let content = crate::library::read_chart(&path)?;
-            Ok(json!(crate::library::resolve_audio(&root, &path, &content)))
-        }
-        Utility::RemoveExternalChart { root, path } => {
-            crate::library::remove_chart_file(&root, &path)?;
-            Ok(Value::Null)
-        }
-        Utility::Archive {
-            chart,
-            work,
-            destination,
-        } => {
-            chart.zip(&work, &destination)?;
-            Ok(json!(destination))
         }
         Utility::EncodeMedia {
             source,
@@ -555,18 +540,6 @@ fn execute(request: Utility, mut progress: impl FnMut(Value)) -> Result<Value, S
             phrases,
             assets,
         } => Ok(Value::String(render(&metadata, &phrases, &assets))),
-        Utility::Publish {
-            job_id,
-            chart,
-            work,
-            library,
-            existing,
-        } => Ok(json!(chart.publish(
-            &job_id,
-            &work,
-            &library,
-            existing.as_deref()
-        )?)),
     }
 }
 
@@ -579,10 +552,7 @@ pub(crate) fn utility() -> Result<(), String> {
     let request =
         serde_json::from_value(envelope["request"].clone()).map_err(|error| error.to_string())?;
     let mut output = io::stdout().lock();
-    let result = execute(request, |event| {
-        let _ = writeln!(output, "{}", json!({"progress": event}));
-        let _ = output.flush();
-    })?;
+    let result = execute(request)?;
     writeln!(output, "{result}").map_err(|error| error.to_string())
 }
 

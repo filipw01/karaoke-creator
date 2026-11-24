@@ -15,7 +15,7 @@ Create UltraStar Deluxe karaoke songs from any audio or video file.
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.11+ for the Demucs and forced-alignment workers
 - Rust 1.90+
 - Node.js 18+
 - ffmpeg installed and available in PATH
@@ -56,45 +56,43 @@ npm install
 npm run tauri:dev
 ```
 
-In development, the desktop shell starts the Python API on `127.0.0.1:8000` when it is not already running. The Vite frontend uses it for managed jobs and stem separation.
+In development, the Tauri shell starts the Rust API on `127.0.0.1:8000`.
+Vite proxies managed-job and playback requests to it. The browser uses the
+same Rust API when started with `backend/run.sh`.
 
-For desktop imports, Rust runs the preparation queue through lyrics review.
-It copies files, supervises yt-dlp, and prepares 44.1 kHz stereo PCM WAVs
-with FFmpeg. A local Python worker runs Demucs. Rust detects tempo and
-handles filename, release, and lyrics lookup. After approval, Python
-continues with alignment and owns managed editor state.
+Rust handles local imports, yt-dlp downloads, FFmpeg processing, tempo and
+pitch tracking, lyrics approval, job state, editor changes, library
+publication, and ZIP export. Rust starts a Python subprocess on demand for
+Demucs or forced alignment and its model evidence. **Retry publish** reuses
+the chart and media from the completed analysis.
 
-Rust is also the implementation behind the browser API for media preparation,
-YouTube, catalog lookup, chart handling, publishing, and ZIP export. Run
-`backend/run.sh` to build the Rust utility before starting the browser API.
-When starting Uvicorn directly, first build the utility with
-`cargo build --locked --manifest-path frontend/src-tauri/Cargo.toml --bin app`
-from the repo root. The API finds `target/debug/app` automatically. Set
-`KARAOKE_RUST_UTILITY` to point to a different build. **Retry publish** reuses
-the finished chart and media after a library write failure.
-
-`KARAOKE_PYTHON` can select the Python interpreter used by the desktop
-process. Set `KARAOKE_YTDLP_PATH` to use a standalone yt-dlp executable.
+Set `KARAOKE_PYTHON` to select the worker interpreter. The Rust backend
+also looks for a Python virtual environment under `backend/venv`.
+For YouTube search and downloads, install standalone yt-dlp on PATH
+or point `KARAOKE_YTDLP_PATH` to it. [yt-dlp release files](https://github.com/yt-dlp/yt-dlp#release-files)
 
 #### Audio backends
 
 Rust detects tempo and uses 120 BPM when the audio has no reliable tempo
-estimate. Rust also runs pYIN. With the Basic Pitch graph available, the
-Rust backend can run Basic Pitch through ONNX Runtime. Set
+estimate. Rust owns loudness normalization, pitch audio resampling and
+high-pass filtering, frame energy, and pYIN contour cleanup and accompaniment
+harmony. With the Basic Pitch graph available, Rust prepares overlapping
+windows, runs inference through ONNX Runtime, and ranks pitch candidates. Set
 `BASIC_PITCH_MODEL_PATH` to the ONNX graph and `ORT_DYLIB_PATH` to the
-ONNX Runtime 1.24 shared library. Resampling and note assignment still run
-alongside the Python alignment pipeline.
+ONNX Runtime 1.24 shared library. Rust assigns notes and syllables after
+the worker supplies canonical alignment evidence.
 
-Set `KARAOKE_WHISPER_CPP_MODEL` to a multilingual GGML Whisper checkpoint
-to use whisper.cpp for draft lyrics. Set `KARAOKE_WHISPER_CPP_PATH` if
-`whisper-cli` is outside PATH. Forced alignment and its ASR evidence still
-use the existing Python models.
+Draft lyrics use whisper.cpp on the machine running the draft. Install `whisper-cli` and set
+`KARAOKE_WHISPER_CPP_MODEL` to a multilingual GGML Whisper checkpoint.
+Set `KARAOKE_WHISPER_CPP_PATH` if `whisper-cli` is outside PATH. When a
+remote alignment worker is configured, set these variables on that worker.
+Forced alignment and its ASR evidence still use the existing Python models. [whisper.cpp and model setup](https://github.com/ggml-org/whisper.cpp#quick-start)
 
 On first launch, choose a working directory for your song library. You can
 open, play, edit, and save existing UltraStar charts in the desktop app without
 Python. When FFmpeg is on PATH, the app caches a PCM copy of MP3 tracks for
 precise seeking. In development, managed jobs appear alongside existing
-charts and the selected folder is shared with the Python API through
+charts and the selected folder is shared with the Rust API through
 `backend/outputs/working-directory.json`. Release builds store the selection
 in the app-data directory. Managed job processing and stem separation still
 need the development or browser API setup.
@@ -116,7 +114,7 @@ WhisperX CTC is enabled by default. Set the device explicitly only when needed:
 cd backend
 source venv/bin/activate
 export WHISPERX_DEVICE=auto                         # cuda when available, otherwise cpu
-uvicorn main:app --reload --host 0.0.0.0 --port 8000 --reload-exclude venv
+./run.sh
 ```
 
 Pitch detection uses the separated vocal stem with Basic Pitch when its
@@ -133,15 +131,30 @@ with `PITCH_WORD_RANGE_MIN_MIDI`, `PITCH_WORD_RANGE_MAX_MIDI`, and
 `PITCH_WORD_RANGE_PENALTY` for unusual registers. A conservative audio-derived
 register adjustment is enabled by
 default; disable it with `PITCH_WORD_ADAPTIVE_RANGE=0` when processing unusual
-registers. The optional MELODIA fusion remains available
-for a deliberate comparison via `PITCH_DETECTOR=basic_pitch_melodia`; it is not
-the default on RAM-constrained machines. Basic Pitch runs in a sequential,
+registers. Basic Pitch runs in a sequential,
 single-threaded ONNX session by default; `BASIC_PITCH_INTRA_THREADS` and
 `BASIC_PITCH_INTER_THREADS` can raise that deliberately.
 For controlled benchmark experiments, `BASIC_PITCH_CANDIDATE_COUNT`,
 `BASIC_PITCH_CANDIDATE_SMOOTH_FRAMES`, and `BASIC_PITCH_OVERLAP_FRAMES` expose
 the posterior-beam size, candidate smoothing, and window overlap; their
 defaults are the RAM-safe production settings.
+
+The optional `PITCH_DETECTOR=torchcrepe` mode uses a float32 CREPE ONNX model.
+Set `TORCHCREPE_ONNX_PATH` to the weights or `TORCHCREPE_ONNX_DIR` to a directory
+with `tiny.onnx` or `full.onnx`. `TORCHCREPE_MODEL` chooses the model in that directory.
+The native decoder emits the center of each decoded pitch bin for repeatable
+results. [CREPE ONNX models](https://huggingface.co/FredrikKarlssonSpeech/torchcrepe-onnx)
+
+The optional `PITCH_DETECTOR=melodia` and `PITCH_DETECTOR=basic_pitch_melodia`
+modes use the native Essentia library through `karaoke-melodia`. Build the helper
+with Essentia's C++ development files, then add it to PATH or set
+`KARAOKE_MELODIA_PATH` to the executable. [Essentia installation](https://essentia.upf.edu/installing.html)
+
+```bash
+c++ -std=c++20 -O2 $(pkg-config --cflags essentia) \
+  frontend/src-tauri/native/melodia.cpp -o karaoke-melodia $(pkg-config --libs essentia)
+```
+
 Repeated lyric contexts use a conservative three-semitone disagreement
 threshold (`PITCH_CONTEXT_REPAIR_MIN_DELTA`) to correct isolated harmonic
 outliers while preserving genuinely transposed repetitions.
@@ -212,8 +225,7 @@ export ALIGNMENT_ASR_BACKEND=qwen
 export QWEN_DEVICE=cuda:0
 ```
 
-Qwen model weights are loaded lazily by the worker; the FastAPI process only
-orchestrates the revision/run contract when a remote worker is configured. To
+Qwen model weights are loaded lazily by the worker. To
 dispatch model work to a separate GPU service, set the endpoint, shared token,
 and the two sides of the audio-volume mapping:
 
@@ -227,6 +239,7 @@ export ALIGNMENT_WORKER_AUDIO_ROOT=/srv/karaoke-worker/audio
 # GPU worker process
 export ALIGNMENT_WORKER_TOKEN=shared-secret
 export ALIGNMENT_WORKER_AUDIO_ROOT=/srv/karaoke-worker/audio
+./run.sh --serve-alignment-worker 0.0.0.0:8001
 ```
 
 The configured worker URL must return a complete `AlignmentWorkerResponse`;
@@ -354,5 +367,5 @@ Place the extracted folder into your UltraStar Deluxe songs directory.
 
 ## Tech stack
 
-- **Backend**: Rust for media and charts, Basic Pitch ONNX and Rust pYIN for pitch detection, and Python/FastAPI for Demucs, WhisperX, and faster-whisper
-- **Frontend**: React, TypeScript, Vite, TailwindCSS
+- **Backend**: Rust and Axum for HTTP, jobs, media, pitch, and charts. Python workers for Demucs, forced alignment, and its transcription evidence.
+- **Frontend**: SolidJS, TypeScript, Vite, Tailwind CSS

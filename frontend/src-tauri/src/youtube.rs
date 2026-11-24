@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
-use crate::{media, worker};
+use crate::media;
 
 pub(crate) fn validate_url(url: &str) -> Result<(), String> {
     let url = Url::parse(url).map_err(|_| "Invalid YouTube URL")?;
@@ -35,14 +35,12 @@ pub(crate) fn validate_url(url: &str) -> Result<(), String> {
     }
 }
 
-fn command(backend: &Path) -> Command {
-    let mut cmd = if let Some(path) = std::env::var_os("KARAOKE_YTDLP_PATH") {
-        Command::new(path)
-    } else {
-        let mut cmd = Command::new(worker::python_executable(backend));
-        cmd.args(["-m", "yt_dlp"]);
-        cmd
-    };
+fn command(backend: &Path) -> Result<Command, String> {
+    let executable = std::env::var_os("KARAOKE_YTDLP_PATH")
+        .filter(|path| !path.is_empty())
+        .or_else(|| executable_on_path("yt-dlp"))
+        .ok_or("Install standalone yt-dlp on PATH or set KARAOKE_YTDLP_PATH")?;
+    let mut cmd = Command::new(executable);
     cmd.args(["--ignore-config", "--no-playlist", "--socket-timeout", "30"])
         .arg("--cache-dir")
         .arg(backend.join("outputs/yt-dlp-cache"));
@@ -59,7 +57,7 @@ fn command(backend: &Path) -> Command {
             .arg(format!("deno:{}", path.to_string_lossy()))
             .args(["--remote-components", "ejs:github"]);
     }
-    cmd
+    Ok(cmd)
 }
 
 fn executable_on_path(name: &str) -> Option<std::ffi::OsString> {
@@ -77,7 +75,7 @@ fn executable_on_path(name: &str) -> Option<std::ffi::OsString> {
 }
 
 pub(crate) fn search(backend: &Path, query: &str) -> Result<Vec<Value>, String> {
-    let output = command(backend)
+    let output = command(backend)?
         .args([
             "--flat-playlist",
             "--skip-download",
@@ -138,7 +136,7 @@ pub(crate) fn download(
     fs::create_dir_all(&output).map_err(|error| error.to_string())?;
     let staging = tempfile::tempdir_in(&upload).map_err(|error| error.to_string())?;
     let format = "bestvideo[height>=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best";
-    let mut child = command(backend)
+    let mut child = command(backend)?
         .args([
             "--format",
             format,

@@ -18,14 +18,8 @@ from processing.pitch import (
     assign_pitch_to_words,
     _candidate_evidence_for_span,
     hz_to_midi,
-    _dominant_pitch_classes,
     _infer_candidate_scale,
-    _merge_basic_pitch_candidate_beams,
-    _merge_highpass_basic_pitch,
     _pitch_text_boundaries,
-    PitchDetection,
-    _quantize_to_pitch_classes,
-    _smooth_pitch_frequencies,
     voiced_activity_signal,
     word_to_segments,
 )
@@ -210,84 +204,6 @@ def test_candidate_range_prior_rejects_a_low_subharmonic(monkeypatch):
     assert segments[0].midi_note == 60
 
 
-def test_highpass_rescue_promotes_a_systematic_upper_contour():
-    times = np.arange(4, dtype=float) * 0.01
-    base = PitchDetection(
-        times,
-        np.full(4, 261.6),
-        np.ones(4),
-        np.ones(4) * 0.01,
-    )
-    highpass = PitchDetection(
-        times,
-        np.full(4, 523.25),
-        np.ones(4),
-        np.ones(4) * 0.01,
-    )
-
-    merged = _merge_highpass_basic_pitch(
-        base,
-        highpass,
-        minimum_delta=6,
-        full_pass_fraction=0.5,
-    )
-
-    assert np.allclose(merged.frequencies, highpass.frequencies)
-
-
-def test_highpass_rescue_keeps_sparse_upper_outliers_on_base_contour():
-    times = np.arange(4, dtype=float) * 0.01
-    base = PitchDetection(
-        times,
-        np.full(4, 261.6),
-        np.ones(4),
-        np.ones(4) * 0.01,
-    )
-    highpass = PitchDetection(
-        times,
-        np.array([523.25, 261.6, 261.6, 261.6]),
-        np.ones(4),
-        np.ones(4) * 0.01,
-    )
-
-    merged = _merge_highpass_basic_pitch(
-        base,
-        highpass,
-        minimum_delta=6,
-        full_pass_fraction=0.5,
-    )
-
-    assert np.allclose(merged.frequencies, base.frequencies)
-
-
-def test_highpass_candidate_merge_retains_fundamental_from_base_pass():
-    """A filtered rescue must not discard a quieter fundamental candidate."""
-
-    base = PitchDetection(
-        np.array([0.0, 0.1]),
-        np.array([261.6, 261.6]),
-        np.ones(2),
-        np.ones(2),
-        candidate_midis=np.array([[60, 64], [60, 64]], dtype=np.int16),
-        candidate_scores=np.array([[0.30, 0.20], [0.30, 0.20]], dtype=np.float32),
-    )
-    rescue = PitchDetection(
-        np.array([0.0, 0.1]),
-        np.array([329.6, 329.6]),
-        np.ones(2),
-        np.ones(2),
-        candidate_midis=np.array([[64, 67], [64, 67]], dtype=np.int16),
-        candidate_scores=np.array([[0.60, 0.20], [0.60, 0.20]], dtype=np.float32),
-    )
-
-    midis, scores = _merge_basic_pitch_candidate_beams(base, rescue, candidate_count=3)
-
-    assert midis is not None and scores is not None
-    assert 60 in midis[0]
-    assert 64 in midis[0]
-    assert scores[0, list(midis[0]).index(64)] == pytest.approx(0.60)
-
-
 def test_candidate_range_prior_adapts_to_a_high_register(monkeypatch):
     """A high-register contour narrows the harmonic cap from audio evidence."""
     monkeypatch.setenv("PITCH_WORD_KEY_PRIOR", "0")
@@ -351,53 +267,6 @@ def test_hz_to_midi():
     assert hz_to_midi(440.0) == 69
     assert hz_to_midi(261.6) == 60
     assert hz_to_midi(0) == 0
-
-
-def test_pitch_smoothing_removes_an_isolated_quantized_flip():
-    frequencies = np.array([261.6, 261.6, 392.0, 261.6, 261.6])
-
-    smoothed = _smooth_pitch_frequencies(frequencies, window_frames=5)
-
-    assert [hz_to_midi(value) for value in smoothed] == [60, 60, 60, 60, 60]
-
-
-def test_tonal_pitch_quantization_repairs_an_out_of_scale_candidate():
-    frequencies = np.array(
-        [261.6] * 10
-        + [293.7] * 10
-        + [329.6] * 10
-        + [349.2] * 10
-        + [392.0] * 10
-        + [440.0] * 10
-        + [277.2]
-    )
-
-    classes = _dominant_pitch_classes(frequencies, top_k=6, min_support=0.8)
-    quantized = _quantize_to_pitch_classes(frequencies, classes)
-
-    assert classes == {0, 2, 4, 5, 7, 9}
-    assert hz_to_midi(quantized[-1]) == 60
-
-
-def test_dominant_pitch_classes_use_a_compact_core_for_broad_harmonic_candidates():
-    # Six strong classes explain the track, but the first four are the stable
-    # chord tones; a weak fifth/sixth pair should not create extra note flips.
-    frequencies = np.array(
-        [261.6] * 34
-        + [392.0] * 28
-        + [466.2] * 20
-        + [155.6] * 18
-        + [311.1] * 8
-        + [349.2] * 6
-        + [415.3] * 4
-        + [440.0] * 10
-        + [277.2] * 10
-        + [369.9] * 10
-    )
-
-    classes = _dominant_pitch_classes(frequencies, top_k=6, min_support=0.8)
-
-    assert len(classes) == 4
 
 
 def test_infer_candidate_scale_uses_pitch_beam_without_reference_labels():

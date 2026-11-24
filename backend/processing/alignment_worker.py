@@ -1,4 +1,4 @@
-"""Internal FastAPI-to-alignment-worker contract and local adapter.
+"""Alignment worker contracts, model evidence, and timing selection.
 
 The request/response shapes are intentionally independent of a particular
 transport. A deployment can send the same dictionaries to a GPU worker over
@@ -9,11 +9,8 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 import math
-import json
 import os
 import tempfile
-import urllib.error
-import urllib.request
 from dataclasses import asdict, replace
 from typing import Any, Mapping, Sequence
 
@@ -187,23 +184,19 @@ def dispatch_worker_alignment(
     worker_token: str | None = None,
     timeout_s: float = 900.0,
 ) -> AlignmentWorkerResponse:
-    """Dispatch a request to a remote GPU worker and validate its result.
+    """Dispatch through Rust and validate the returned alignment evidence."""
+    from processing.rust_utility import call
 
-    ``worker_url`` is the worker's result endpoint, not the API's acceptance
-    endpoint. Keeping this transport helper synchronous makes it safe to call
-    through the API event loop's executor without adding another dependency.
-    """
-
-    payload = _model_dict(request)
-    request_body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if worker_token:
-        headers["X-Alignment-Worker-Token"] = worker_token
-    http_request = urllib.request.Request(worker_url, data=request_body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(http_request, timeout=timeout_s) as response_stream:
-            response_data = json.loads(response_stream.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        response_data = call(
+            "dispatch_worker_alignment",
+            request=_model_dict(request),
+            url=worker_url,
+            token=worker_token,
+            timeout=timeout_s,
+            timeout_seconds=max(1, timeout_s + 5),
+        )
+    except (RuntimeError, OSError, ValueError) as exc:
         raise AlignmentWorkerError(f"Remote alignment worker request failed: {exc}") from exc
     try:
         response = AlignmentWorkerResponse(**response_data)
@@ -2126,28 +2119,9 @@ def collect_model_evidence(
 def run_worker_alignment(request: AlignmentWorkerRequest) -> AlignmentWorkerResponse:
     """Execute the same deterministic worker contract on a GPU host."""
 
-    evidence, errors = collect_model_evidence(request)
     if not request.tokens:
-        anchors = evidence.get("vocal_stem") or evidence.get("original_mix") or []
-        draft_text = " ".join(token.text for token in anchors).strip()
-        if not draft_text:
-            response = AlignmentWorkerResponse(
-                job_id=request.job_id,
-                alignment_run_id=request.alignment_run_id,
-                lyric_revision_id=request.lyric_revision_id,
-                status="failed",
-                diagnostics={"source_errors": errors, "reason": "no ASR draft evidence"},
-            )
-            return validate_worker_response(response, request)
-        response = AlignmentWorkerResponse(
-            job_id=request.job_id,
-            alignment_run_id=request.alignment_run_id,
-            lyric_revision_id=request.lyric_revision_id,
-            status="completed",
-            draft_text=draft_text,
-            diagnostics={"source_errors": errors, "draft_text": draft_text},
-        )
-        return validate_worker_response(response, request)
+        raise AlignmentWorkerError("Forced alignment requires lyric tokens")
+    evidence, errors = collect_model_evidence(request)
     if not any(evidence.values()):
         response = AlignmentWorkerResponse(
             job_id=request.job_id,

@@ -1,839 +1,334 @@
-"""API lifecycle and compatibility contract tests."""
+"""Browser API and managed workflow tests against the Rust server."""
 
 from __future__ import annotations
 
-import asyncio
+import io
 import json
+import math
+import os
+import queue
 import shutil
+import struct
 import subprocess
 import sys
-import uuid
+import threading
+import time
+import urllib.error
+import urllib.request
 import wave
+import zipfile
+from contextlib import contextmanager
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
-from fastapi import HTTPException
-from starlette.requests import Request
 
-backend = Path(__file__).resolve().parent.parent
+backend = Path(__file__).resolve().parents[1]
 if str(backend) not in sys.path:
     sys.path.insert(0, str(backend))
 
-import main
-from models import (
-    AlignmentEvidence,
-    AlignmentRun,
-    AlignmentRunStatus,
-    AlignmentStatus,
-    Job,
-    JobResult,
-    JobStatus,
-    LyricRevision,
-    LyricSource,
-    SongMetadata,
-    Word,
-    WordAlignment,
-)
-from processing.alignment import edit_word_boundary, merge_alignment_locks, tokenize_lyrics
-from processing.alignment_worker import AlignmentWorkerResponse
-from processing.metadata import clean_music_title
-
-
-@pytest.fixture(autouse=True)
-def isolate_contract_test_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setattr(main, "_persist_jobs", lambda: None)
-    monkeypatch.setattr(main, "WORKING_DIRECTORY_FILE", str(tmp_path / "working-directory.json"))
-
-
-def test_clean_music_title_removes_video_noise():
-    assert clean_music_title("Numb (Official Video)") == "Numb"
-    assert clean_music_title("Dynamite Official MV") == "Dynamite"
-    assert clean_music_title("Hello - Official Lyric Video") == "Hello"
-
-
-def _job(tmp_path: Path) -> Job:
-    revision = LyricRevision(
-        id="revision",
-        song_id="job",
-        language="en",
-        source="manual",
-        raw_text="hello world",
-    )
-    revision.tokens = tokenize_lyrics(revision.raw_text, revision.id, "en")
-    vocals = tmp_path / "vocals.wav"
-    vocals.touch()
-    return Job(
-        id="job",
-        status=JobStatus.DONE,
-        result=JobResult(lyric_revision=revision),
-        lyric_revisions=[revision],
-        selected_lyric_revision_id=revision.id,
-        vocals_path=str(vocals),
-    )
-
-
-def _awaiting_lyrics_job() -> Job:
-    return Job(
-        id="job",
-        status=JobStatus.AWAITING_LYRICS,
-        found_lyrics="wrong lyrics",
-        metadata=SongMetadata(title="Song", artist="Artist", language="en"),
-    )
-
-
-def test_library_reports_queue_positions_in_fifo_order(monkeypatch: pytest.MonkeyPatch):
-    main.jobs.clear()
-    main.jobs["later"] = Job(
-        id="later",
-        status=JobStatus.EXTRACTING_AUDIO,
-        queued_at="2025-01-02T00:00:00+00:00",
-    )
-    main.jobs["sooner"] = Job(
-        id="sooner",
-        status=JobStatus.EXTRACTING_AUDIO,
-        queued_at="2025-01-01T00:00:00+00:00",
-    )
-    monkeypatch.setattr(main, "_working_directory", lambda: None)
-    request = Request({
-        "type": "http",
-        "method": "GET",
-        "path": "/api/library",
-        "headers": [],
-        "query_string": b"",
-        "client": ("127.0.0.1", 8000),
-        "server": ("127.0.0.1", 8000),
-        "scheme": "http",
-    })
-
-    response = asyncio.run(main.list_library(request))
-    positions = {song["id"]: song["queue_position"] for song in response["songs"]}
-
-    assert positions == {"later": 2, "sooner": 1}
-
-
-def test_completed_song_is_published_into_selected_library(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    library = tmp_path / "songs"
-    library.mkdir()
-    work_dir = tmp_path / "job-output"
-    work_dir.mkdir()
-    audio = work_dir / "Artist - Song.mp3"
-    audio.write_bytes(b"audio")
-    job = Job(
-        id="job",
-        status=JobStatus.DONE,
-        work_dir=str(work_dir),
-        metadata=SongMetadata(title="Song", artist="Artist"),
-        result=JobResult(
-            metadata=SongMetadata(title="Song", artist="Artist"),
-            audio_file=audio.name,
-            ultrastar_txt="#TITLE:Song\n#ARTIST:Artist\n",
-        ),
-    )
-    monkeypatch.setattr(main, "_working_directory", lambda: str(library))
-
-    main._publish_song_to_library(job)
-
-    chart = library / "Artist - Song" / "Artist - Song.txt"
-    assert chart.read_text(encoding="utf-8") == job.result.ultrastar_txt
-    assert (chart.parent / audio.name).read_bytes() == b"audio"
-    assert job.library_path == str(chart.parent)
-
-    main.jobs.clear()
-    main.jobs[job.id] = job
-    request = Request({
-        "type": "http",
-        "method": "GET",
-        "path": "/api/library",
-        "headers": [],
-        "query_string": b"",
-        "client": ("127.0.0.1", 8000),
-        "server": ("127.0.0.1", 8000),
-        "scheme": "http",
-    })
-    response = asyncio.run(main.list_library(request))
-    assert [song["id"] for song in response["songs"]] == ["job"]
-    (library / "Other.txt").write_text("#TITLE:Other\n", encoding="utf-8")
-
-    response = asyncio.run(main.list_library(request, managed_only=True))
-    assert [song["id"] for song in response["songs"]] == ["job"]
-    assert response["published_paths"] == ["Artist - Song/Artist - Song.txt"]
-
-
-def test_managed_playback_uses_existing_pcm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    export = tmp_path / "Song [VOC].mp3"
-    export.write_bytes(b"export")
-    wav = tmp_path / "vocals.wav"
-    wav.write_bytes(b"RIFF" + b"\0" * 40)
-    job = Job(id="job", work_dir=str(tmp_path), result=JobResult(vocals_file=export.name))
-    monkeypatch.setattr(main, "jobs", {job.id: job})
-
-    response = asyncio.run(main.get_audio(job.id, "vocals"))
-
-    assert response.media_type == "audio/wav"
-    assert response.path == wav
-    assert export.read_bytes() == b"export"
-
-
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="MP3 playback conversion requires ffmpeg")
-def test_external_mp3_playback_caches_a_fresh_pcm_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    library = tmp_path / "songs"
-    library.mkdir()
-    source = library / "Song.mp3"
-    (library / "Song.txt").write_text("#MP3:Song.mp3\n")
-    outputs = tmp_path / "outputs"
-    monkeypatch.setattr(main, "OUTPUT_DIR", str(outputs))
-    monkeypatch.setattr(main, "_working_directory", lambda: str(library))
-
-    def write_source(duration: float) -> bytes:
-        subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"sine=duration={duration}", str(source)],
-            check=True,
-        )
-        return source.read_bytes()
-
-    for duration, sample_count in ((0.25, 11025), (0.5, 22050)):
-        mp3 = write_source(duration)
-        response = asyncio.run(main.get_external_song_audio("Song.txt"))
-        assert response.media_type == "audio/wav"
-        assert source.read_bytes() == mp3
-        with wave.open(str(response.path)) as audio:
-            assert audio.getframerate() == 44100
-            assert audio.getnframes() == sample_count
-        cached = asyncio.run(main.get_external_song_audio("Song.txt"))
-        assert cached.path == response.path
-
-    assert len(list((outputs / "playback-audio").glob("*.wav"))) == 2
-
-
-def test_removing_managed_song_deletes_upload_output_and_published_files(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    uploads = tmp_path / "uploads"
-    outputs = tmp_path / "outputs"
-    library = tmp_path / "selected-songs"
-    different_current_directory = tmp_path / "new-current-songs"
-    upload_dir = uploads / "job"
-    output_dir = outputs / "job"
-    published_dir = library / "Artist - Song"
-    for directory in (upload_dir, output_dir, published_dir, different_current_directory):
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "asset.bin").write_bytes(b"song")
-    job = Job(
-        id="job",
-        status=JobStatus.DONE,
-        upload_path=str(upload_dir / "input.mp3"),
-        work_dir=str(output_dir),
-        library_path=str(published_dir),
-        library_root=str(library),
-    )
-    monkeypatch.setattr(main, "UPLOAD_DIR", str(uploads))
-    monkeypatch.setattr(main, "OUTPUT_DIR", str(outputs))
-    monkeypatch.setattr(main, "_working_directory", lambda: str(different_current_directory))
-    monkeypatch.setattr(main, "_persist_jobs", lambda: None)
-    monkeypatch.setattr(main, "jobs", {"job": job})
-    request = Request({
-        "type": "http",
-        "method": "DELETE",
-        "path": "/api/library/song",
-        "headers": [],
-        "query_string": b"",
-        "client": ("127.0.0.1", 8000),
-        "server": ("127.0.0.1", 8000),
-        "scheme": "http",
-    })
-
-    response = asyncio.run(main.remove_library_song(request, job_id="job", path=None))
-
-    assert response == {"removed": "job"}
-    assert not upload_dir.exists()
-    assert not output_dir.exists()
-    assert not published_dir.exists()
-    assert "job" not in main.jobs
-
-
-def test_managed_directory_removal_rejects_paths_outside_storage_root(tmp_path: Path):
-    root = tmp_path / "owned"
-    outside = tmp_path / "outside"
-    root.mkdir()
-    outside.mkdir()
-    marker = outside / "keep.txt"
-    marker.write_text("keep")
-
-    with pytest.raises(ValueError, match="directly inside"):
-        main._remove_managed_directory(str(outside), str(root))
-
-    assert marker.exists()
-
-
-def test_removing_stale_test_job_skips_upload_path_outside_managed_root(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    uploads = tmp_path / "uploads"
-    outputs = tmp_path / "outputs"
-    output_dir = outputs / "job"
-    external_upload = tmp_path / "pytest-temp" / "input.mp3"
-    output_dir.mkdir(parents=True)
-    external_upload.parent.mkdir()
-    external_upload.touch()
-    job = Job(
-        id="job",
-        status=JobStatus.ERROR,
-        upload_path=str(external_upload),
-        work_dir=str(output_dir),
-    )
-    monkeypatch.setattr(main, "UPLOAD_DIR", str(uploads))
-    monkeypatch.setattr(main, "OUTPUT_DIR", str(outputs))
-    monkeypatch.setattr(main, "_working_directory", lambda: None)
-    monkeypatch.setattr(main, "jobs", {"job": job})
-    request = Request({
-        "type": "http",
-        "method": "DELETE",
-        "path": "/api/library/song",
-        "headers": [],
-        "query_string": b"",
-        "client": ("127.0.0.1", 8000),
-        "server": ("127.0.0.1", 8000),
-        "scheme": "http",
-    })
-
-    response = asyncio.run(main.remove_library_song(request, job_id="job", path=None))
-
-    assert response == {"removed": "job"}
-    assert not output_dir.exists()
-    assert external_upload.exists()
-    assert "job" not in main.jobs
-
-
-def test_removing_external_song_deletes_its_subdirectory_and_contents(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    root = tmp_path / "songs"
-    song_directory = root / "Artist" / "Song"
-    song_directory.mkdir(parents=True)
-    (song_directory / "Song.txt").write_text("#TITLE:Song\n")
-    (song_directory / "Song.mp3").write_bytes(b"audio")
-    monkeypatch.setattr(main, "_working_directory", lambda: str(root))
-    request = Request({
-        "type": "http",
-        "method": "DELETE",
-        "path": "/api/library/song",
-        "headers": [],
-        "query_string": b"",
-        "client": ("127.0.0.1", 8000),
-        "server": ("127.0.0.1", 8000),
-        "scheme": "http",
-    })
-
-    response = asyncio.run(
-        main.remove_library_song(request, job_id=None, path="Artist/Song/Song.txt"),
-    )
-
-    assert response == {"removed": "Artist/Song/Song.txt"}
-    assert not song_directory.exists()
-    assert (root / "Artist").is_dir()
-    assert root.is_dir()
-
-
-def test_removing_external_song_at_library_root_preserves_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    root = tmp_path / "songs"
-    root.mkdir()
-    chart = root / "Song.txt"
-    chart.write_text("#TITLE:Song\n")
-    monkeypatch.setattr(main, "_working_directory", lambda: str(root))
-    request = Request({
-        "type": "http",
-        "method": "DELETE",
-        "path": "/api/library/song",
-        "headers": [],
-        "query_string": b"",
-        "client": ("127.0.0.1", 8000),
-        "server": ("127.0.0.1", 8000),
-        "scheme": "http",
-    })
-
-    response = asyncio.run(main.remove_library_song(request, job_id=None, path="Song.txt"))
-
-    assert response == {"removed": "Song.txt"}
-    assert not chart.exists()
-    assert root.is_dir()
-
-
-def test_previous_result_remains_readable_after_failed_run(tmp_path: Path):
-    job = _job(tmp_path)
-    job.status = JobStatus.ERROR
-    main.jobs.clear()
-    main.jobs[job.id] = job
-
-    result = asyncio.run(main.get_result(job.id))
-
-    assert result["lyric_revision"]["id"] == "revision"
-
-
-def test_realign_rejects_null_reset_token_payload(tmp_path: Path):
-    job = _job(tmp_path)
-    main.jobs.clear()
-    main.jobs[job.id] = job
-
-    with pytest.raises(HTTPException) as error:
-        asyncio.run(
-            main.start_alignment_run(
-                job.id,
-                {"lyric_revision_id": "revision", "reset_token_ids": None},
-            )
-        )
-
-    assert error.value.status_code == 422
-
-
-def test_save_revision_rejects_non_string_text(tmp_path: Path):
-    job = _job(tmp_path)
-    main.jobs.clear()
-    main.jobs[job.id] = job
-
-    with pytest.raises(HTTPException) as error:
-        asyncio.run(main.save_lyric_revision(job.id, {"raw_text": None}))
-
-    assert error.value.status_code == 422
-
-
-def test_worker_ingress_is_fail_closed_without_configured_credentials(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("ALIGNMENT_WORKER_TOKEN", raising=False)
-    body = {
-        "job_id": "job",
-        "alignment_run_id": "run",
-        "lyric_revision_id": "revision",
-        "language": "en",
-        "original_audio_ref": "/audio/mix.wav",
-        "vocal_stem_audio_ref": "/audio/vocals.wav",
-        "tokens": [],
-    }
-
-    with pytest.raises(HTTPException) as error:
-        asyncio.run(main.request_worker_alignment(body, None))
-
-    assert error.value.status_code == 503
-
-
-def test_alignment_run_is_registered_before_async_execution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    job = _job(tmp_path)
-    main.jobs.clear()
-    main.jobs[job.id] = job
-    scheduled: list[object] = []
-
-    async def fake_execute(*_: object) -> None:
-        return None
-
-    monkeypatch.setattr(main, "_execute_realignment", fake_execute)
-    monkeypatch.setattr(asyncio, "create_task", lambda coroutine: scheduled.append(coroutine))
-
-    response = asyncio.run(
-        main.start_alignment_run(job.id, {"lyric_revision_id": "revision", "reset_token_ids": []})
-    )
-
-    assert response["status"] == "running"
-    assert len(job.alignment_runs) == 1
-    assert job.alignment_runs[0].status == AlignmentRunStatus.RUNNING
-    assert scheduled
-    scheduled[0].close()
-
-
-def test_canonical_result_keeps_one_word_per_token_separate_from_pitch_segments(tmp_path: Path):
-    job = _job(tmp_path)
-    job.real_bpm = 120.0
-    revision = job.result.lyric_revision
-    assert revision is not None
-    run = job.alignment_runs[0] if job.alignment_runs else None
-    if run is None:
-        from models import AlignmentRun
-
-        run = AlignmentRun("run", revision.id, "completed", "test")
-    canonical = [
-        Word(text="hello", start=1.0, end=2.0, token_id=revision.tokens[0].id),
-        Word(text="world", start=2.0, end=3.0, token_id=revision.tokens[1].id),
-    ]
-    pitch = [
-        Word(text="hel", start=1.0, end=1.5, token_id=revision.tokens[0].id),
-        Word(text="lo", start=1.5, end=2.0, token_id=revision.tokens[0].id),
-    ]
+from processing.rust_utility import RustUtilityUnavailable, executable_path
+
+OWNER = {"X-Karaoke-Owner": "test-owner"}
+
+WORKER = """
+import json
+import sys
+for line in sys.stdin:
+    payload = json.loads(line)
+    assert payload["operation"] == "managed_alignment"
+    request = payload["request"]["request"]
     alignments = [
-        WordAlignment(token.id, run.id, word.start, word.end, AlignmentStatus.ALIGNED, 1.0, AlignmentEvidence())
-        for token, word in zip(revision.tokens, canonical)
-    ]
-
-    main._apply_canonical_result(job, revision, run, alignments, canonical, pitch, [])
-
-    assert [word.text for word in job.result.words] == ["hello", "world"]
-    assert [word.text for word in job.result.pitch_words] == ["hel", "lo"]
-    assert len(job.result.alignment_results["canonical"].words) == 2
-
-
-def test_boundary_refresh_rebuilds_export_layer_from_canonical_spans(tmp_path: Path):
-    job = _job(tmp_path)
-    job.real_bpm = 120.0
-    revision = job.result.lyric_revision
-    assert revision is not None
-    run = AlignmentRun("run", revision.id, AlignmentRunStatus.COMPLETED, "test")
-    job.result.alignment_run = run
-    job.result.word_alignments = [
-        WordAlignment(
-            token_id=token.id,
-            alignment_run_id=run.id,
-            start=float(index + 2),
-            end=float(index + 2.5),
-            status=AlignmentStatus.ESTIMATED,
-            confidence=0.3,
-            evidence=AlignmentEvidence(),
-        )
-        for index, token in enumerate(revision.tokens)
-    ]
-
-    main._refresh_legacy_result_from_canonical(job)
-
-    assert [word.start for word in job.result.words] == [2.0, 3.0]
-    assert [word.start for word in job.result.alignment_results["canonical"].words] == [2.0, 3.0]
-
-
-def test_boundary_refresh_keeps_persisted_pitch_source_spans_separate(tmp_path: Path):
-    job = _job(tmp_path)
-    job.real_bpm = 120.0
-    assert job.result is not None
-    revision = job.result.lyric_revision
-    assert revision is not None
-    run = AlignmentRun("run", revision.id, AlignmentRunStatus.COMPLETED, "test")
-    job.result.alignment_run = run
-    job.result.word_alignments = [
-        WordAlignment(
-            token_id=token.id,
-            alignment_run_id=run.id,
-            start=float(index * 2),
-            end=float(index * 2 + 2),
-            status=AlignmentStatus.ESTIMATED,
-            confidence=0.3,
-            evidence=AlignmentEvidence(),
-        )
-        for index, token in enumerate(revision.tokens)
-    ]
-    job.result.pitch_words = [
-        Word(
-            text=token.display_text,
-            start=float(index),
-            end=float(index + 0.5),
-            pitch_hz=440.0,
-            midi_note=69,
-            token_id=token.id,
-        )
-        for index, token in enumerate(revision.tokens)
-    ]
-
-    main._refresh_legacy_result_from_canonical(job)
-
-    assert [(word.start, word.end) for word in job.result.words] == [(0.0, 2.0), (2.0, 4.0)]
-    assert [(word.start, word.end) for word in job.result.pitch_words] == [(0.0, 0.5), (1.0, 1.5)]
-
-
-def test_pitch_source_keeps_repaired_companion_boundary_from_partial_lock():
-    source = WordAlignment(
-        "t",
-        "canonical",
-        0.8,
-        1.0,
-        AlignmentStatus.ALIGNED,
-        0.9,
-        AlignmentEvidence(),
-    )
-
-    start_locked = edit_word_boundary(
-        WordAlignment("t", "old", 1.0, 1.4, AlignmentStatus.ALIGNED, 0.9, AlignmentEvidence()),
-        start=1.1,
-    )
-    incoming_end_before_locked_start = WordAlignment(
-        "t", "new", 0.7, 1.0, AlignmentStatus.ALIGNED, 0.8, AlignmentEvidence()
-    )
-    merged_start = merge_alignment_locks([start_locked], [incoming_end_before_locked_start])
-    pitch_start = main._pitch_alignments_with_boundary_locks([source], merged_start)[0]
-
-    end_locked = edit_word_boundary(
-        WordAlignment("t", "old", 1.0, 1.4, AlignmentStatus.ALIGNED, 0.9, AlignmentEvidence()),
-        end=1.1,
-    )
-    incoming_start_after_locked_end = WordAlignment(
-        "t", "new", 1.2, 1.3, AlignmentStatus.ALIGNED, 0.8, AlignmentEvidence()
-    )
-    merged_end = merge_alignment_locks([end_locked], [incoming_start_after_locked_end])
-    pitch_end = main._pitch_alignments_with_boundary_locks([source], merged_end)[0]
-
-    assert (pitch_start.start, pitch_start.end) == (1.1, 1.4)
-    assert (pitch_end.start, pitch_end.end) == (1.0, 1.1)
-
-
-def test_failed_realignment_keeps_a_completed_result_exportable(tmp_path: Path):
-    job = _job(tmp_path)
-    revision = job.result.lyric_revision
-    assert revision is not None
-    job.result.alignment_run = AlignmentRun("run", revision.id, AlignmentRunStatus.COMPLETED, "test")
-    job.status = JobStatus.ERROR
-
-    assert main._serialize_result(job)["export_ready"] is True
-    job.status = JobStatus.ALIGNING_WORDS
-    assert main._serialize_result(job)["export_ready"] is False
-
-
-def test_remote_draft_helper_uses_worker_audio_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    job = _job(tmp_path)
-    mix = tmp_path / "mix.wav"
-    mix.touch()
-    job.audio_path = str(mix)
-    monkeypatch.setenv("ALIGNMENT_WORKER_URL", "http://worker/v1/alignments")
-    monkeypatch.setenv("ALIGNMENT_WORKER_TOKEN", "secret")
-    monkeypatch.setenv("ALIGNMENT_API_AUDIO_ROOT", str(tmp_path))
-    monkeypatch.setenv("ALIGNMENT_WORKER_AUDIO_ROOT", str(tmp_path / "worker"))
-
-    def fake_dispatch(request, worker_url, *, worker_token):
-        assert worker_url.endswith("/v1/alignments")
-        assert worker_token == "secret"
-        assert request.tokens == []
-        return AlignmentWorkerResponse(
-            job_id=request.job_id,
-            alignment_run_id=request.alignment_run_id,
-            lyric_revision_id=request.lyric_revision_id,
-            status="completed",
-            draft_text="hello world",
-        )
-
-    monkeypatch.setattr("processing.alignment_worker.dispatch_worker_alignment", fake_dispatch)
-
-    assert main._draft_text_from_remote_worker(job, "run", "en") == "hello world"
-
-
-def test_phase1_pauses_for_lyrics_review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    input_path = tmp_path / "input.mp3"
-    audio_path = tmp_path / "audio.wav"
-    vocals_path = tmp_path / "vocals.wav"
-    instrumental_path = tmp_path / "instrumental.wav"
-    for path in (input_path, audio_path, vocals_path, instrumental_path):
-        path.touch()
-
-    job = Job(
-        id="job",
-        upload_path=str(input_path),
-        metadata=SongMetadata(title="Song", artist="Artist", language="en"),
-    )
-    main.jobs.clear()
-    main.jobs[job.id] = job
-    scheduled: list[object] = []
-
-    async def prepare(operation, progress, **arguments):
-        assert operation == "prepare_browser_media"
-        assert arguments["media"]["source"] == str(input_path)
-        progress({"status": "separating_vocals", "message": "Separating"})
-        assert job.status == JobStatus.SEPARATING_VOCALS
-        return {
-            "audio_path": str(audio_path), "vocals_path": str(vocals_path),
-            "instrumental_path": str(instrumental_path), "real_bpm": 120.0,
-            "found_lyrics": "online lyrics", "has_video": False,
-            "metadata": {"genre": "", "year": ""},
+        {
+            "token_id": token["id"], "alignment_run_id": request["alignment_run_id"],
+            "start": 0.15 + index * 0.30, "end": 0.30 + index * 0.30,
+            "status": "aligned", "confidence": 0.8,
+            "evidence": {"selected_model": "test", "selected_audio": "vocal_stem",
+                         "reasons": [], "candidate_scores": []},
+            "start_locked": False, "end_locked": False,
         }
-
-    monkeypatch.setattr(main, "call_with_progress", prepare)
-    monkeypatch.setattr(asyncio, "create_task", lambda coroutine: scheduled.append(coroutine))
-
-    asyncio.run(main._process_phase1(job))
-
-    assert job.status == JobStatus.AWAITING_LYRICS
-    assert job.found_lyrics == "online lyrics"
-    assert job.lyric_revisions == []
-    assert scheduled == []
+        for index, token in enumerate(request["tokens"])
+    ]
+    print(json.dumps({"version": 1, "result": {
+        "alignments": alignments, "pitch_source_alignments": alignments,
+        "alignment_backend": request["alignment_backend"], "diagnostics": {"worker": "test"},
+    }}), flush=True)
+"""
 
 
-def test_desktop_import_adopts_completed_rust_preparation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    import_id = uuid.uuid4()
-    uploads = tmp_path / "uploads"
-    outputs = tmp_path / "outputs"
-    staged_upload = uploads / str(import_id)
-    staged_output = outputs / str(import_id)
-    staged_upload.mkdir(parents=True)
-    staged_output.mkdir(parents=True)
-    (staged_upload / "input").write_bytes(b"original media")
-    (staged_upload / "prepared-media.json").write_text(
-        json.dumps({"original_filename": "A Song.mp4", "has_video": True}),
-        encoding="utf-8",
+@contextmanager
+def server(root: Path, worker_only: bool = False, **runtime: str):
+    try:
+        executable = executable_path()
+    except RustUtilityUnavailable:
+        pytest.skip("Requires the Rust backend executable")
+    environment = os.environ.copy()
+    for key in (
+        "KARAOKE_API_TOKEN", "ALIGNMENT_WORKER_URL", "ALIGNMENT_WORKER_TOKEN",
+        "ALIGNMENT_WORKER_AUDIO_ROOT", "KARAOKE_MAX_UPLOAD_BYTES",
+    ):
+        environment.pop(key, None)
+    environment.update(
+        KARAOKE_PYTHON=sys.executable,
+        PITCH_DETECTOR="pyin",
+        ALIGNMENT_PRIMARY_BACKEND="legacy",
     )
-    audio_path = staged_output / "audio.wav"
-    with wave.open(str(audio_path), "wb") as audio:
+    environment.update(runtime)
+    flag = "--serve-alignment-worker" if worker_only else "--serve-api"
+    with subprocess.Popen(
+        [executable, flag, str(root), "127.0.0.1:0"],
+        stderr=subprocess.PIPE, text=True, env=environment,
+    ) as process:
+        startup: queue.Queue[str] = queue.Queue()
+        diagnostics: list[str] = []
+
+        def drain() -> None:
+            assert process.stderr is not None
+            for line in process.stderr:
+                diagnostics.append(line)
+                if line.startswith("Karaoke API listening on "):
+                    startup.put("http://" + line.split()[-1])
+            startup.put("")
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        try:
+            address = startup.get(timeout=15)
+            assert address, "".join(diagnostics)
+
+            def request(path, body=None, *, method=None, headers=None, raw=False):
+                headers = dict(headers or {})
+                if body is not None and not isinstance(body, bytes):
+                    headers["Content-Type"] = "application/json"
+                    body = json.dumps(body).encode()
+                request = urllib.request.Request(address + path, data=body, headers=headers, method=method)
+                try:
+                    with urllib.request.urlopen(request, timeout=15) as response:
+                        content = response.read()
+                        return response.status, content if raw else json.loads(content)
+                except urllib.error.HTTPError as error:
+                    with error:
+                        content = error.read()
+                    return error.code, json.loads(content) if content else None
+
+            request.address = address
+            yield request
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            reader.join(timeout=5)
+
+
+def write_audio(path: Path) -> None:
+    with wave.open(str(path), "wb") as audio:
         audio.setparams((2, 2, 44100, 0, "NONE", "not compressed"))
-        audio.writeframes(b"\x00" * 4)
+        frames = (
+            round(8192 * math.sin(2 * math.pi * 220 * index / 44100))
+            for index in range(44100)
+        )
+        audio.writeframes(b"".join(struct.pack("<hh", value, value) for value in frames))
 
-    monkeypatch.setattr(main, "UPLOAD_DIR", str(uploads))
-    monkeypatch.setattr(main, "OUTPUT_DIR", str(outputs))
-    monkeypatch.setattr(main, "jobs", {})
-    local = Request({"type": "http", "client": ("127.0.0.1", 8000), "headers": []})
-    body = main.PreparedMediaImport(import_id=import_id, genre="Rock", year="2024")
-    with pytest.raises(HTTPException) as incomplete:
-        asyncio.run(main.register_prepared_media(local, body))
-    assert incomplete.value.status_code == 404
 
+def await_result(request, job_id):
+    cutoff = time.monotonic() + 20
+    while time.monotonic() < cutoff:
+        code, state = request(f"/api/jobs/{job_id}/status", headers=OWNER)
+        assert code == 200, state
+        assert state["status"] != "error", state
+        if state["status"] == "done":
+            code, result = request(f"/api/jobs/{job_id}/result", headers=OWNER)
+            assert code == 200, result
+            return result
+        time.sleep(0.05)
+    pytest.fail("Timed out waiting for the managed alignment result")
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="Managed output requires FFmpeg")
+def test_import_alignment_edit_export_restart_and_delete(tmp_path: Path):
+    (tmp_path / "desktop_worker.py").write_text(WORKER, encoding="utf-8")
+    job_id = str(uuid4())
+    upload = tmp_path / "uploads" / job_id
+    work = tmp_path / "outputs" / job_id
+    songs = tmp_path / "songs"
+    for directory in (upload, work, songs):
+        directory.mkdir(parents=True)
+    (upload / "input").write_bytes(b"original media")
+    (upload / "prepared-media.json").write_text(
+        json.dumps({"original_filename": "Artist - Song.mp3", "has_video": False}),
+    )
+    write_audio(work / "audio.wav")
     for name in ("vocals.wav", "instrumental.wav"):
-        shutil.copyfile(audio_path, staged_output / name)
-    (staged_upload / "desktop-preparation.json").write_text(
-        json.dumps({"status": "awaiting_lyrics", "real_bpm": 123.0, "found_lyrics": "approved later"}),
-        encoding="utf-8",
-    )
-    registered = asyncio.run(main.register_prepared_media(local, body))
-    assert registered == {"job_id": str(import_id)}
-    assert asyncio.run(main.register_prepared_media(local, body)) == registered
-    job = main.jobs[str(import_id)]
-    assert job.status == JobStatus.AWAITING_LYRICS
-    assert job.metadata.title == "A Song"
-    assert job.has_video
-    assert job.real_bpm == 123.0
-    assert job.found_lyrics == "approved later"
-    assert Path(job.audio_path) == audio_path.resolve()
-    assert Path(job.vocals_path) == (staged_output / "vocals.wav").resolve()
+        shutil.copyfile(work / "audio.wav", work / name)
 
-    different_owner = Request({"type": "http", "client": ("127.0.0.1", 8000), "headers": []})
-    different_owner.state.owner_id = "other"
-    with pytest.raises(HTTPException) as forbidden:
-        asyncio.run(main.register_prepared_media(different_owner, body))
-    assert forbidden.value.status_code == 404
+    jobs = f"/api/jobs/{job_id}"
+    with server(tmp_path) as request:
+        assert request("/api/library/working-directory", {"directory": str(songs)}, method="PUT")[0] == 200
+        registration = {"import_id": job_id, "title": "Song", "artist": "Artist", "language": "en"}
+        assert request("/api/desktop/import", registration, headers=OWNER)[0] == 404
+        (upload / "desktop-preparation.json").write_text(json.dumps({
+            "status": "awaiting_lyrics", "found_lyrics": "hello world", "real_bpm": 120,
+        }))
+        for _ in range(2):
+            assert request("/api/desktop/import", registration, headers=OWNER) == (200, {"job_id": job_id})
+        assert request("/api/desktop/import", registration)[0] == 404
+        assert request(f"{jobs}/found-lyrics", headers=OWNER) == (200, {"lyrics": "hello world"})
+        assert request(f"{jobs}/status")[0] == 404
+        assert request(f"{jobs}/confirm-lyrics", {"lyrics": "hello world"}, headers=OWNER) == (200, {"status": "started"})
 
+        result = await_result(request, job_id)
+        assert result["export_ready"]
+        assert result["lyric_revision"]["source"] == "online"
+        assert len(result["word_alignments"]) == 2
+        assert [word["text"] for word in result["words"]] == ["hello", "world"]
+        assert "hello" in result["ultrastar_txt"]
+        assert (songs / "Artist - Song" / "Artist - Song.txt").is_file()
+        code, listed = request("/api/library?managed_only=true", headers=OWNER)
+        assert code == 200
+        assert listed["published_paths"] == ["Artist - Song/Artist - Song.txt"]
 
-def test_desktop_import_rejects_missing_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(main, "UPLOAD_DIR", str(tmp_path / "uploads"))
-    monkeypatch.setattr(main, "OUTPUT_DIR", str(tmp_path / "outputs"))
-    monkeypatch.setattr(main, "jobs", {})
-    local = Request({"type": "http", "client": ("127.0.0.1", 8000), "headers": []})
-    with pytest.raises(HTTPException) as missing:
-        asyncio.run(main.register_prepared_media(local, main.PreparedMediaImport(import_id=uuid.uuid4())))
-    assert missing.value.status_code == 404
-    assert main.jobs == {}
-
-
-def test_retry_publish_uses_the_finished_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    job = _job(tmp_path)
-    job.status = JobStatus.ERROR
-    job.failed_phase = "publish"
-    job.error = "Permission denied"
-    result = job.result
-    monkeypatch.setattr(main, "jobs", {job.id: job})
-    published = []
-    monkeypatch.setattr(main, "_publish_song_to_library", lambda saved: published.append(saved.result))
-    scheduled = []
-    monkeypatch.setattr(asyncio, "create_task", lambda coroutine: scheduled.append(coroutine))
-
-    assert asyncio.run(main.retry_job(job.id)) == {"status": "retrying", "phase": "publish"}
-    assert job.status == JobStatus.GENERATING
-    assert len(scheduled) == 1
-    asyncio.run(scheduled.pop())
-    assert job.status == JobStatus.DONE
-    assert job.result is result
-    assert published == [result]
-
-
-def test_confirm_lyrics_creates_revision_and_resumes_phase2(monkeypatch: pytest.MonkeyPatch):
-    job = _awaiting_lyrics_job()
-    main.jobs.clear()
-    main.jobs[job.id] = job
-    scheduled: list[object] = []
-    monkeypatch.setattr(asyncio, "create_task", lambda coroutine: scheduled.append(coroutine))
-
-    response = asyncio.run(main.confirm_lyrics(job.id, {"lyrics": "correct lyrics"}))
-
-    assert response["status"] == "started"
-    assert job.status == JobStatus.EXTRACTING_LYRICS
-    assert job.confirmed_lyrics == "correct lyrics"
-    assert len(job.lyric_revisions) == 1
-    assert job.lyric_revisions[0].source == LyricSource.MANUAL
-    assert scheduled
-    scheduled[0].close()
-
-
-def test_confirm_lyrics_empty_value_selects_asr_path(monkeypatch: pytest.MonkeyPatch):
-    job = _awaiting_lyrics_job()
-    main.jobs.clear()
-    main.jobs[job.id] = job
-    scheduled: list[object] = []
-    monkeypatch.setattr(asyncio, "create_task", lambda coroutine: scheduled.append(coroutine))
-
-    response = asyncio.run(main.confirm_lyrics(job.id, {"lyrics": ""}))
-
-    assert response["status"] == "started"
-    assert job.status == JobStatus.EXTRACTING_LYRICS
-    assert job.confirmed_lyrics == ""
-    assert job.lyric_revisions == []
-    assert scheduled
-    scheduled[0].close()
-
-
-def test_status_is_available_for_pre_result_lyrics_review():
-    job = _awaiting_lyrics_job()
-    main.jobs.clear()
-    main.jobs[job.id] = job
-
-    status = asyncio.run(main.get_status(job.id))
-
-    assert status["metadata"] == {"title": "Song", "artist": "Artist"}
-    assert status["found_lyrics"] == "wrong lyrics"
-
-
-def test_retry_phase1_reuses_existing_audio_and_starts_background(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    source = tmp_path / "input.mp3"
-    audio = tmp_path / "audio.wav"
-    vocals = tmp_path / "vocals.wav"
-    source.touch()
-    audio.touch()
-    vocals.touch()
-    job = Job(
-        id="job",
-        status=JobStatus.ERROR,
-        failed_phase="phase1",
-        upload_path=str(source),
-        audio_path=str(audio),
-        vocals_path=str(vocals),
-        confirmed_lyrics="lyrics",
-    )
-    main.jobs.clear()
-    main.jobs[job.id] = job
-    scheduled: list[object] = []
-    monkeypatch.setattr(asyncio, "create_task", lambda coroutine: scheduled.append(coroutine))
-
-    response = asyncio.run(main.retry_job(job.id))
-
-    assert response == {"status": "retrying", "phase": "phase1"}
-    assert job.status == JobStatus.EXTRACTING_AUDIO
-    assert job.queued_at
-    assert scheduled
-    scheduled[0].close()
-
-
-def test_browser_youtube_adopts_prepared_rust_media(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    job = Job(id="job", status=JobStatus.DOWNLOADING)
-    monkeypatch.setattr(main, "jobs", {job.id: job})
-    request = main.YouTubeDownloadRequest(
-        url="https://www.youtube.com/watch?v=example", title="", artist="Chosen artist",
-        language="en", genre="", year="",
-    )
-
-    async def download(operation, progress, **arguments):
-        assert operation == "download_youtube"
-        assert arguments["url"] == request.url
-        assert arguments["job_id"] == job.id
-        progress({"progress_percent": 55.0})
-        assert job.progress_percent == 55.0
-        return {
-            "original_filename": "Song.mp4", "title": "Song", "artist": "Artist", "has_video": True,
-            "upload_path": str(tmp_path / "input"), "audio_path": str(tmp_path / "audio.wav"),
-            "work_dir": str(tmp_path),
+        notes = {
+            "phrases": [{
+                "notes": [{"note_type": ":", "text": " edited", "start_beat": 0, "duration_beats": 4, "pitch": 9}],
+                "end_beat": 5,
+            }],
         }
+        assert request(f"{jobs}/notes", notes, headers=OWNER, method="PUT")[0] == 200
+        token = result["word_alignments"][0]["token_id"]
+        boundary = f"{jobs}/word-alignments/{token}"
+        code, edited = request(boundary, {"start": 0.13}, headers=OWNER, method="PATCH")
+        assert code == 200 and edited["alignment"]["start_locked"]
+        code, reset = request(f"{boundary}/reset", {"boundaries": ["start"]}, headers=OWNER)
+        assert code == 200 and not reset["alignment"]["start_locked"]
+        assert request(f"{jobs}/audio/vocals", headers={**OWNER, "Range": "bytes=0-3"}, raw=True) == (206, b"RIFF")
 
-    monkeypatch.setattr(main, "call_with_progress", download)
-    asyncio.run(main._download_youtube_video(job.id, request))
+        code, archive = request(f"{jobs}/download", headers=OWNER, raw=True)
+        assert code == 200
+        with zipfile.ZipFile(io.BytesIO(archive)) as file:
+            assert b" edited" in file.read("Artist - Song/Artist - Song.txt")
 
-    assert job.status == JobStatus.PENDING
-    assert job.has_video and job.audio_path == str(tmp_path / "audio.wav")
-    assert job.metadata.title == "Song"
-    assert job.metadata.artist == "Chosen artist"
+        code, saved = request(f"{jobs}/lyric-revisions", {"raw_text": "Cześć -- świecie", "language": "pl"}, headers=OWNER)
+        assert code == 201
+        revision = saved["revision"]
+        assert [word["source_index"] for word in revision["tokens"]] == [0, 2]
+        assert request(f"{jobs}/download", headers=OWNER)[0] == 409
+        assert request(f"{jobs}/alignment-runs", {"lyric_revision_id": revision["id"], "reset_token_ids": None}, headers=OWNER)[0] == 422
+        code, run = request(f"{jobs}/alignment-runs", {"lyric_revision_id": revision["id"]}, headers=OWNER)
+        assert code == 202 and run["status"] == "running"
+        result = await_result(request, job_id)
+        assert result["export_ready"]
+        assert result["lyric_revision"]["language"] == "pl"
+        assert result["note_overrides"]["note:0:0"]["pitch"] == 9
+
+    with server(tmp_path, KARAOKE_PYTHON="nonexistent-worker") as request:
+        code, restored = request(f"{jobs}/result", headers=OWNER)
+        assert code == 200 and restored == result
+        assert request(f"/api/library/song?job_id={job_id}", method="DELETE")[0] == 404
+        assert request(f"/api/library/song?job_id={job_id}", method="DELETE", headers=OWNER) == (200, {"removed": job_id})
+        assert not work.exists()
+        assert not upload.exists()
+        assert not (songs / "Artist - Song").exists()
+
+
+def test_rust_ingress_requires_tokens_and_bounds_uploads(tmp_path: Path):
+    with server(tmp_path, KARAOKE_PYTHON="nonexistent-worker", KARAOKE_API_TOKEN="demo", KARAOKE_MAX_UPLOAD_BYTES="4") as request:
+        assert request("/api/jobs")[0] == 401
+        assert request("/api/jobs?access_token=demo") == (200, {"songs": []})
+        assert request("/v1/alignments", {})[0] == 503
+        upload = b'--test\r\nContent-Disposition: form-data; name="file"; filename="Song.mp3"\r\n\r\naudio\r\n--test--\r\n'
+        headers = {"Authorization": "Bearer demo", "Content-Type": "multipart/form-data; boundary=test"}
+        assert request("/api/upload", upload, headers=headers)[0] == 413
+        assert request("/api/jobs?access_token=demo") == (200, {"songs": []})
+        assert not list((tmp_path / "uploads").iterdir())
+
+
+def test_benchmark_import_and_archive(tmp_path: Path):
+    cache = tmp_path / "benchmarks"
+    cache.mkdir()
+    chart = cache / "Song.txt"
+    chart.write_text(
+        "#TITLE:Song\n#ARTIST:Artist\n#BPM:480\n#MP3:Song.wav\n"
+        ": 0 4 3 Hel\n: 4 4 3 lo\n: 8 4 4  world\nE\n",
+    )
+    audio = cache / "Song.wav"
+    write_audio(audio)
+    with server(tmp_path, KARAOKE_PYTHON="nonexistent-worker") as request:
+        data = {"chart_path": str(chart), "audio_path": str(audio), "vocal_path": str(audio)}
+        code, imported = request("/api/benchmark/import", data, headers=OWNER)
+        assert code == 201, imported
+        job_id = imported["job_id"]
+        assert imported["result"]["lyric_revision"]["raw_text"] == "Hello world"
+        assert [word["midi_note"] for word in imported["result"]["words"]] == [63, 64]
+        assert request(f"/api/jobs/{job_id}/download", headers=OWNER, raw=True)[0] == 200
+        assert request(f"/api/library/song?job_id={job_id}", method="DELETE", headers=OWNER)[0] == 200
+        assert chart.is_file() and audio.is_file()
+
+
+def test_alignment_worker_deployment_is_independent_of_the_browser_api(tmp_path: Path):
+    with server(tmp_path, worker_only=True, ALIGNMENT_WORKER_TOKEN="demo") as request:
+        assert request("/api/jobs")[0] == 404
+        assert request("/v1/alignments", {})[0] == 401
+        assert not (tmp_path / "outputs").exists()
+
+
+def test_worker_alignment_accepts_only_authenticated_contained_audio(tmp_path: Path):
+    audio = tmp_path / "audio"
+    audio.mkdir()
+    vocal = audio / "vocal.wav"
+    original = audio / "mix.wav"
+    outside = tmp_path / "outside.wav"
+    for path in (vocal, original, outside):
+        path.touch()
+    (tmp_path / "desktop_worker.py").write_text("""
+import json
+import sys
+for line in sys.stdin:
+    request = json.loads(line)["request"]
+    response = {key: request[key] for key in ("job_id", "alignment_run_id", "lyric_revision_id")}
+    response.update(status="completed", alignments=[], diagnostics={"checked": True}, draft_text=None)
+    print(json.dumps({"version": 1, "result": {"response": response}}), flush=True)
+""")
+    with server(tmp_path, worker_only=True, ALIGNMENT_WORKER_TOKEN="demo", ALIGNMENT_WORKER_AUDIO_ROOT=str(audio)) as request:
+        headers = {"X-Alignment-Worker-Token": "demo"}
+        body = {
+            "job_id": "job", "alignment_run_id": "run", "lyric_revision_id": "revision",
+            "original_audio_ref": str(original), "vocal_stem_audio_ref": str(vocal),
+            "language": "en", "tokens": [{"id": "revision:token:0"}],
+        }
+        assert request("/v1/alignments", body)[0] == 401
+        assert request("/v1/alignments", {**body, "original_audio_ref": str(outside)}, headers=headers)[0] == 422
+        code, aligned = request("/v1/alignments", body, headers=headers)
+        assert code == 202 and aligned["diagnostics"]["checked"]
+        assert aligned["job_id"] == "job" and aligned["alignment_run_id"] == "run"
+
+
+def test_retry_publish_uses_saved_result_without_starting_inference(tmp_path: Path):
+    output = tmp_path / "outputs"
+    work = output / "job"
+    work.mkdir(parents=True)
+    songs = tmp_path / "songs"
+    songs.mkdir()
+    write_audio(work / "audio.wav")
+    (output / "working-directory.json").write_text(json.dumps({"directory": str(songs)}))
+    metadata = {"artist": "Artist", "title": "Song", "language": "en", "genre": "", "year": "", "bpm": 120, "gap_ms": 0}
+    chart = "#TITLE:Song\n#ARTIST:Artist\n#MP3:audio.wav\n#BPM:480\n: 0 4 0 Hello\nE\n"
+    run = {"id": "run", "status": "completed", "selected_strategy": "legacy"}
+    (output / "jobs.json").write_text(json.dumps({
+        "job": {
+            "id": "job", "owner_id": OWNER["X-Karaoke-Owner"], "work_dir": str(work), "status": "error",
+            "error": "permission denied", "failed_phase": "publish", "metadata": metadata,
+            "selected_lyric_revision_id": "revision",
+            "result": {"metadata": metadata, "audio_file": "audio.wav", "ultrastar_txt": chart,
+                       "lyric_revision": {"id": "revision", "language": "en"}, "alignment_run": run},
+        },
+    }))
+    with server(tmp_path, KARAOKE_PYTHON="nonexistent-worker") as request:
+        assert request("/api/jobs/job/retry", method="POST", headers=OWNER) == (200, {"status": "retrying", "phase": "publish"})
+        result = await_result(request, "job")
+        assert result["ultrastar_txt"] == chart
+        assert result["alignment_run"]["id"] == "run"
+        assert (songs / "Artist - Song" / "Artist - Song.txt").read_text() == chart

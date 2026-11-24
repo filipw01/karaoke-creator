@@ -21,13 +21,15 @@ def _demucs_available() -> bool:
     return result.returncode == 0
 
 
-def separate_vocals(audio_path: str, output_dir: str) -> tuple[str, str]:
+def separate_vocals(audio_path: str, output_dir: str, *, require_model: bool = False) -> tuple[str, str]:
     """Separate vocals from instrumental using Demucs htdemucs model.
 
     If demucs is not installed (e.g. on Python 3.14), copies the original audio to both outputs (no separation).
     Returns (vocals_path, instrumental_path).
     """
     if not _demucs_available():
+        if require_model:
+            raise RuntimeError("Demucs is not installed; vocals cannot be separated.")
         log.warning("demucs not installed; using original audio for both vocals and instrumental")
         vocals_dst = os.path.join(output_dir, "vocals.wav")
         instrumental_dst = os.path.join(output_dir, "instrumental.wav")

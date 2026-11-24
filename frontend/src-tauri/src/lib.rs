@@ -1,9 +1,23 @@
+mod api;
+mod basic_pitch;
 mod catalog;
 mod chart_output;
+mod crepe;
 mod external_chart;
 mod library;
+mod library_api;
+mod managed_alignment;
+mod managed_api;
+mod managed_benchmark;
+mod managed_editor;
+mod managed_ingest;
+mod managed_state;
 mod media;
+mod melodia;
 mod native_pitch;
+mod note_assignment;
+mod pitch_contour;
+mod pitch_detection;
 mod preparation;
 mod tempo;
 mod whisper_draft;
@@ -24,7 +38,7 @@ fn backend_directory() -> Option<std::path::PathBuf> {
     .flatten()
     .flat_map(std::path::Path::ancestors)
     .map(|directory| directory.join("backend"))
-    .find(|directory| directory.join("main.py").is_file())
+    .find(|directory| directory.join("desktop_worker.py").is_file())
 }
 
 #[cfg(debug_assertions)]
@@ -38,66 +52,127 @@ fn start_dev_backend(directory: &std::path::Path) {
         return;
     }
 
-    let mut command = std::process::Command::new(worker::python_executable(directory));
-    if let Ok(executable) = std::env::current_exe() {
-        command.env("KARAOKE_RUST_UTILITY", executable);
-    }
-    if let Err(error) = command
-        .args([
-            "-m",
-            "uvicorn",
-            "main:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "8000",
-        ])
-        .current_dir(directory)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        log::warn!("Unable to start development Python backend: {error}");
-    }
+    let directory = directory.to_path_buf();
+    tauri::async_runtime::spawn(async move {
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], 8000));
+        if let Err(error) = api::serve(directory, address, false).await {
+            log::warn!("Unable to start development API: {error}");
+        }
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--desktop-pyin")) {
-        let dimensions = std::env::args()
-            .skip(2)
-            .take(2)
-            .map(|argument| argument.parse::<usize>())
-            .collect::<Result<Vec<_>, _>>();
-        let result = match dimensions.as_deref() {
-            Ok(&[frame, hop]) => native_pitch::run_pyin(frame, hop),
-            _ => Err("pYIN requires a frame and hop length".into()),
-        };
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(flag) = arguments.first() {
+        if flag == "--serve-api" || flag == "--serve-alignment-worker" {
+            let result = (|| -> Result<(), String> {
+                let [_, directory, address] = arguments.as_slice() else {
+                    return Err("Usage: app --serve-api <backend directory> <address:port>".into());
+                };
+                let address = address
+                    .to_str()
+                    .ok_or("Invalid API listen address")?
+                    .parse()
+                    .map_err(|error: std::net::AddrParseError| error.to_string())?;
+                tokio::runtime::Runtime::new()
+                    .map_err(|error| error.to_string())?
+                    .block_on(api::serve(
+                        directory.into(),
+                        address,
+                        flag == "--serve-alignment-worker",
+                    ))
+            })();
+            if let Err(error) = result {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+    let utility = match arguments.as_slice() {
+        [flag] if flag == "--desktop-utility" => Some(chart_output::utility().map_err(Into::into)),
+        [flag, source] if flag == "--desktop-crepe" => {
+            Some(crepe::run(std::path::Path::new(source)))
+        }
+        [flag, source] if flag == "--desktop-melodia" => {
+            Some(melodia::run(std::path::Path::new(source)))
+        }
+        [flag, model, source] if flag == "--desktop-pitch-melodia" => Some(melodia::fuse(
+            std::path::Path::new(model),
+            std::path::Path::new(source),
+        )),
+        [flag, model, source] if flag == "--desktop-pitch" => Some(basic_pitch::run(
+            std::path::Path::new(model),
+            std::path::Path::new(source),
+            None,
+        )),
+        [flag, model, source, cutoff] if flag == "--desktop-pitch" => Some((|| {
+            let cutoff = cutoff
+                .to_str()
+                .ok_or("Invalid high-pass frequency")?
+                .parse()?;
+            basic_pitch::run(
+                std::path::Path::new(model),
+                std::path::Path::new(source),
+                Some(cutoff),
+            )
+        })()),
+        [flag, source] if flag == "--desktop-pyin" => {
+            Some(native_pitch::run_pyin(std::path::Path::new(source), None))
+        }
+        [flag, source, mix] if flag == "--desktop-pyin" => Some(native_pitch::run_pyin(
+            std::path::Path::new(source),
+            Some(std::path::Path::new(mix)),
+        )),
+        [flag, source, rate, highpass] if flag == "--desktop-pitch-audio" => Some((|| {
+            let rate = rate.to_str().ok_or("Invalid pitch sample rate")?.parse()?;
+            let highpass = highpass
+                .to_str()
+                .ok_or("Invalid high-pass frequency")?
+                .parse()?;
+            native_pitch::run_decode(std::path::Path::new(source), rate, highpass)
+        })()),
+        [flag, frame, hop] if flag == "--desktop-pitch-rms" => Some((|| {
+            let frame = frame.to_str().ok_or("Invalid RMS frame length")?.parse()?;
+            let hop = hop.to_str().ok_or("Invalid RMS hop length")?.parse()?;
+            native_pitch::run_rms(frame, hop)
+        })()),
+        [flag, ..]
+            if matches!(
+                flag.to_str(),
+                Some(
+                    "--desktop-pyin"
+                        | "--desktop-pitch"
+                        | "--desktop-crepe"
+                        | "--desktop-melodia"
+                        | "--desktop-pitch-melodia"
+                        | "--desktop-pitch-audio"
+                        | "--desktop-pitch-rms"
+                        | "--desktop-utility"
+                )
+            ) =>
+        {
+            Some(Err("Invalid Rust utility arguments".into()))
+        }
+        _ => None,
+    };
+    if let Some(result) = utility {
         if let Err(error) = result {
             eprintln!("{error}");
             std::process::exit(1);
         }
         return;
     }
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--desktop-pitch")) {
-        let model = std::env::args_os().nth(2);
-        let result = model
-            .as_deref()
-            .ok_or("Missing ONNX model".into())
-            .and_then(|path| native_pitch::run(std::path::Path::new(path)));
-        if let Err(error) = result {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-        return;
+    #[cfg(debug_assertions)]
+    let backend = backend_directory();
+    #[cfg(not(debug_assertions))]
+    let backend = None;
+    #[cfg(debug_assertions)]
+    if let Some(backend) = &backend {
+        start_dev_backend(backend);
     }
-    if std::env::args().nth(1).as_deref() == Some("--desktop-utility") {
-        if let Err(error) = chart_output::utility() {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-        return;
-    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -123,14 +198,9 @@ pub fn run() {
             youtube::search_local_youtube,
             chart_output::save_managed_zip,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let data = app.path().app_data_dir()?;
             let settings = data.join("working-directory.json");
-            #[cfg(debug_assertions)]
-            let backend = backend_directory();
-            #[cfg(not(debug_assertions))]
-            let backend = None;
-
             #[cfg(debug_assertions)]
             let settings = {
                 app.handle().plugin(
@@ -139,7 +209,6 @@ pub fn run() {
                         .build(),
                 )?;
                 if let Some(backend) = &backend {
-                    start_dev_backend(backend);
                     backend.join("outputs/working-directory.json")
                 } else {
                     settings

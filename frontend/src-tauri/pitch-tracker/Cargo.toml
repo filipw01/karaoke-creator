@@ -6,3 +6,4 @@ publish = false
 
 [dependencies]
 pyin = "1.2"
+rustfft = "6"

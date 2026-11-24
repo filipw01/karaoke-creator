@@ -24,7 +24,23 @@ fn timed_words(transcript: &Value) -> Vec<Value> {
             {
                 return None;
             }
-            Some(json!({"text": text, "start": start, "end": end}))
+            let (sum, count) = segment["tokens"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|token| {
+                    token["text"].as_str().is_some_and(|text| {
+                        !text.starts_with("[_") && text.chars().any(char::is_alphanumeric)
+                    })
+                })
+                .filter_map(|token| token["p"].as_f64())
+                .fold((0.0, 0), |(sum, count), p| (sum + p, count + 1));
+            let confidence = if count == 0 {
+                0.0
+            } else {
+                sum / f64::from(count)
+            };
+            Some(json!({"text": text, "start": start, "end": end, "confidence": confidence}))
         })
         .collect()
 }
@@ -62,7 +78,7 @@ pub(crate) fn transcribe(audio: &Path, language: &str) -> Result<Vec<Value>, Str
             "--max-len",
             "1",
             "--split-on-word",
-            "--output-json",
+            "--output-json-full",
             "--output-file",
         ])
         .arg(&output)
@@ -97,13 +113,15 @@ mod tests {
     #[test]
     fn converts_valid_word_offsets_from_milliseconds() {
         let words = timed_words(&json!({"transcription": [
-            {"text": " cześć", "offsets": {"from": 100, "to": 350}},
+            {"text": " cześć", "offsets": {"from": 100, "to": 350}, "tokens":[
+                {"text":" cze", "p":0.75}, {"text":"ść", "p":0.5}, {"text":"[_EOT_]", "p":1.0}
+            ]},
             {"text": "!", "offsets": {"from": 350, "to": 400}},
             {"text": "missing time", "offsets": {"from": 500, "to": 450}},
         ]}));
         assert_eq!(
             words,
-            vec![json!({"text": "cześć", "start": 0.1, "end": 0.35})]
+            vec![json!({"text": "cześć", "start": 0.1, "end": 0.35, "confidence":0.625})]
         );
     }
 }

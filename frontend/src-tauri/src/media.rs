@@ -54,6 +54,71 @@ pub(crate) fn write_pcm_wav(source: &Path, destination: &Path) -> io::Result<()>
     Ok(())
 }
 
+pub(crate) fn normalize_audio(source: &Path, destination: &Path) -> Result<(), String> {
+    const LOUDNESS: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
+    let measurement = Command::new("ffmpeg")
+        .args(["-nostdin", "-i"])
+        .arg(source)
+        .args([
+            "-af",
+            &format!("{LOUDNESS}:print_format=json"),
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .map_err(|error| format!("Unable to run FFmpeg: {error}"))?;
+    let stderr = String::from_utf8_lossy(&measurement.stderr);
+    let stats = stderr.rfind('}').and_then(|end| {
+        let start = stderr[..end].rfind('{')?;
+        serde_json::from_str::<serde_json::Value>(&stderr[start..=end]).ok()
+    });
+    let filter = match stats {
+        Some(stats) => {
+            let integrated = stats["input_i"].as_str().unwrap_or("-16");
+            let peak = stats["input_tp"].as_str().unwrap_or("-1.5");
+            let range = stats["input_lra"].as_str().unwrap_or("11");
+            let threshold = stats["input_thresh"].as_str().unwrap_or("-26");
+            format!(
+                "{LOUDNESS}:measured_I={integrated}:measured_TP={peak}:measured_LRA={range}:measured_thresh={threshold}:linear=true"
+            )
+        }
+        None => LOUDNESS.to_owned(),
+    };
+    let parent = destination
+        .parent()
+        .ok_or("Missing normalized audio directory")?;
+    let staged = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    let output = Command::new("ffmpeg")
+        .args(["-nostdin", "-loglevel", "error", "-y", "-i"])
+        .arg(source)
+        .args([
+            "-af",
+            &filter,
+            "-c:a",
+            "pcm_s16le",
+            "-ar",
+            "44100",
+            "-ac",
+            "1",
+            "-f",
+            "wav",
+        ])
+        .arg(staged.path())
+        .output()
+        .map_err(|error| format!("Unable to run FFmpeg: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "FFmpeg could not normalize audio: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    staged
+        .persist(destination)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 pub(crate) fn encode_output(source: &Path, destination: &Path, video: bool) -> Result<(), String> {
     let options: &[&str] = if video {
         &["-c", "copy", "-movflags", "+faststart"]

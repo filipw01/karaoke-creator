@@ -64,7 +64,7 @@ impl Library {
         }
     }
 
-    fn directory(&self) -> Result<Option<PathBuf>, String> {
+    pub(crate) fn directory(&self) -> Result<Option<PathBuf>, String> {
         match fs::read(&self.settings_file) {
             Ok(bytes) => serde_json::from_slice::<Settings>(&bytes)
                 .map(|settings| settings.directory)
@@ -79,23 +79,24 @@ impl Library {
             .ok()
             .filter(|directory| directory.is_dir() && directory.to_str().is_some())
             .ok_or("Working directory must be an existing folder")?;
-        let settings = Settings {
-            directory: Some(directory.clone()),
-        };
-        let encoded = serde_json::to_vec(&settings).map_err(|error| error.to_string())?;
+        self.write_directory(Some(directory.clone()))?;
+        Ok(directory)
+    }
+
+    pub(crate) fn write_directory(&self, directory: Option<PathBuf>) -> Result<(), String> {
+        let encoded = serde_json::to_vec(&Settings { directory }).map_err(|error| error.to_string())?;
         if let Some(parent) = self.settings_file.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
         write_atomically(&self.settings_file, &encoded)
-            .map_err(|error| format!("Unable to set working directory: {error}"))?;
-        Ok(directory)
+            .map_err(|error| format!("Unable to set working directory: {error}"))
     }
 
     fn list(&self) -> Result<SongList, String> {
         Ok(scan_songs(self.directory()?))
     }
 
-    fn chart_path(&self, path: &str) -> Result<(PathBuf, PathBuf), String> {
+    pub(crate) fn chart_path(&self, path: &str) -> Result<(PathBuf, PathBuf), String> {
         let configured = self
             .directory()?
             .ok_or("Working directory is not configured")?;

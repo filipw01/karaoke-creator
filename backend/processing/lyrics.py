@@ -5,10 +5,13 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-
-from faster_whisper import WhisperModel
+from typing import TYPE_CHECKING
 
 from models import Word
+from processing.rust_utility import call as rust_utility
+
+if TYPE_CHECKING:
+    from faster_whisper import WhisperModel
 
 
 log = logging.getLogger("lyrics")
@@ -41,11 +44,17 @@ class LyricsParams:
 
 
 def _get_model(model_size: str = "medium") -> WhisperModel:
+    from faster_whisper import WhisperModel
+
     if model_size not in _model_cache:
         log.info("Loading Whisper model (%s, int8)...", model_size)
         _model_cache[model_size] = WhisperModel(model_size, device="cpu", compute_type="int8")
         log.info("Whisper model loaded (%s)", model_size)
     return _model_cache[model_size]
+
+
+def draft_lyrics(audio_path: str, language: str) -> list[Word]:
+    return [Word(**word) for word in rust_utility("whisper_draft", audio=audio_path, language=language)]
 
 
 def extract_lyrics(
@@ -96,7 +105,16 @@ def extract_lyrics(
     log.info("Transcribing with params: model=%s, vad=%s, vad_thresh=%.2f, pad=%dms, beam=%d, no_speech=%.2f",
              p.model_size, p.vad_filter, p.vad_threshold, p.speech_pad_ms, p.beam_size, p.no_speech_threshold)
 
-    segments, info = model.transcribe(vocals_path, **transcribe_kwargs)
+    try:
+        segments, info = model.transcribe(vocals_path, **transcribe_kwargs)
+    except TypeError as exc:
+        # Released faster-whisper versions pass this obsolete keyword to PyAV 19.
+        if "unexpected keyword argument 'metadata_errors'" not in str(exc):
+            raise
+        from processing.native_pitch import load_mono
+
+        audio = load_mono(vocals_path, 16000)
+        segments, info = model.transcribe(audio, **transcribe_kwargs)
 
     log.info("Detected language: %s (prob=%.2f)", info.language, info.language_probability)
 

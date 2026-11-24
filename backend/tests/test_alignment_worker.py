@@ -1,4 +1,4 @@
-"""Contract tests for the FastAPI/GPU-worker alignment seam."""
+"""Contract tests for the Rust API/GPU-worker alignment seam."""
 
 from __future__ import annotations
 

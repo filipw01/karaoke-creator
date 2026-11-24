@@ -1,3 +1,7 @@
+mod harmony;
+
+pub use harmony::chroma;
+
 /// Tracks pitch for mono samples at 22,050 Hz. Unvoiced frequencies are NaN.
 pub fn track(samples: &[f64], frame: usize, hop: usize) -> (Vec<f64>, Vec<bool>, Vec<f64>) {
     let mut tracker = pyin::PYINExecutor::new(
