@@ -66,8 +66,22 @@ fn recover(mut job: Snapshot) -> Snapshot {
                 json!("Retry publishing to reuse the finished chart and media."),
             );
         }
+        "generating" => {
+            job.insert("queued_at".into(), json!(""));
+            job.insert("status".into(), json!("error"));
+            job.insert("failed_phase".into(), json!("phase2"));
+            job.insert("progress_percent".into(), json!(0.0));
+            job.insert(
+                "error".into(),
+                json!("UltraStar song generation was interrupted."),
+            );
+            job.insert(
+                "progress_message".into(),
+                json!("Retry processing to reuse the prepared audio and vocal stems."),
+            );
+        }
         "extracting_audio" | "separating_vocals" | "detecting_bpm" | "searching_lyrics"
-        | "aligning_words" | "extracting_lyrics" | "detecting_pitch" | "generating" => {
+        | "aligning_words" | "extracting_lyrics" | "detecting_pitch" => {
             job.insert("queued_at".into(), json!(""));
             job.insert("status".into(), json!("pending"));
             job.insert("progress_percent".into(), json!(0.0));
@@ -158,6 +172,7 @@ mod tests {
             "interrupted": {"id":"interrupted","status":"downloading"},
             "review": {"id":"review","status":"awaiting_lyrics","found_lyrics":"Words"},
             "analysis": {"id":"analysis","status":"aligning_words","alignment_runs":[{"id":"run","status":"running"}]},
+            "generation": {"id":"generation","status":"generating","failed_phase":"phase2"},
             "publish": {"id":"publish","status":"generating","failed_phase":"publish","result":{"ultrastar_txt":"#TITLE:Song"}},
             "published": {"id":"published","status":"done","result":{
                 "ultrastar_txt":"#TITLE:Other","alignment_comparison":{"status":"running"},"note_overrides":{"0":{"pitch":8}}
@@ -173,6 +188,8 @@ mod tests {
             restored["analysis"]["alignment_runs"][0]["status"],
             "failed"
         );
+        assert_eq!(restored["generation"]["status"], "error");
+        assert_eq!(restored["generation"]["failed_phase"], "phase2");
         assert_eq!(restored["publish"]["status"], "error");
         assert_eq!(
             restored["publish"]["result"]["ultrastar_txt"],

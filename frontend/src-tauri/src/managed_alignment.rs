@@ -159,6 +159,7 @@ fn report_failure(
     failure: Failure,
     label: &str,
 ) {
+    let message = format!("{label}: {}", failure.error);
     let result = update(jobs, id, |job| {
         if let Some(run) = run.filter(|run| run["status"] == "running") {
             let mut run = run.clone();
@@ -167,12 +168,15 @@ fn report_failure(
             set_run(job, &run);
         }
         job["error"] = json!(failure.error);
-        status(job, "error", &format!("{label}: {}", failure.error));
+        status(job, "error", &message);
         Ok(job.clone())
     });
     match result {
         Ok(job) => emit(jobs, id, &job),
-        Err(error) => log::error!("Unable to store alignment failure for {id}: {}", error.1),
+        Err(error) => {
+            log::error!("Unable to store alignment failure for {id}: {}", error.1);
+            jobs.show_unpersisted_error(id, &failure.error, &message);
+        }
     }
 }
 

@@ -93,6 +93,20 @@ impl ManagedJobs {
         });
     }
 
+    pub(crate) fn show_unpersisted_error(&self, id: &str, error: &str, message: &str) {
+        if let Ok(mut snapshot) = self.snapshot.write()
+            && let Some(job) = snapshot.get_mut(id)
+        {
+            job["status"] = json!("error");
+            job["error"] = json!(error);
+            job["progress_message"] = json!(message);
+            self.emit(
+                id,
+                json!({"status":"error","error":error,"message":message}),
+            );
+        }
+    }
+
     pub(crate) fn update_download(&self, job_id: &str, percent: f64) {
         let message = format!("Downloading... {percent:.1}%");
         if let Ok(mut snapshot) = self.snapshot.write() {
