@@ -286,22 +286,22 @@ fn pitch_by_token(variant: &Value) -> HashMap<String, i64> {
         .collect()
 }
 
-pub(crate) fn compare(job: &Value, sofa: &Value, legacy: &Value) -> Value {
-    let sofa_words = array(&sofa["words"]);
-    let legacy_words = array(&legacy["words"]);
+pub(crate) fn compare(job: &Value, forcealign: &Value, mms: &Value) -> Value {
+    let forcealign_words = array(&forcealign["words"]);
+    let mms_words = array(&mms["words"]);
     let keyed = |word: &Value| !field_text(word, "token_id").is_empty();
-    let left: HashMap<_, _> = sofa_words
+    let left: HashMap<_, _> = forcealign_words
         .iter()
         .filter(|word| keyed(word))
         .map(|word| (field_text(word, "token_id"), word))
         .collect();
-    let right: HashMap<_, _> = legacy_words
+    let right: HashMap<_, _> = mms_words
         .iter()
         .filter(|word| keyed(word))
         .map(|word| (field_text(word, "token_id"), word))
         .collect();
     let mut seen = HashSet::new();
-    let mut pairs: Vec<_> = sofa_words
+    let mut pairs: Vec<_> = forcealign_words
         .iter()
         .filter_map(|word| {
             let id = field_text(word, "token_id");
@@ -312,7 +312,7 @@ pub(crate) fn compare(job: &Value, sofa: &Value, legacy: &Value) -> Value {
         })
         .collect();
     if pairs.is_empty() {
-        pairs.extend(sofa_words.iter().zip(legacy_words));
+        pairs.extend(forcealign_words.iter().zip(mms_words));
     }
     let bpm = job["metadata"]["bpm"]
         .as_f64()
@@ -321,8 +321,8 @@ pub(crate) fn compare(job: &Value, sofa: &Value, legacy: &Value) -> Value {
         .unwrap_or_default()
         .max(1.0);
     let one_beat = 60.0 / (bpm * 16.0);
-    let sofa_pitch = pitch_by_token(sofa);
-    let legacy_pitch = pitch_by_token(legacy);
+    let forcealign_pitch = pitch_by_token(forcealign);
+    let mms_pitch = pitch_by_token(mms);
     let mut timing = Vec::new();
     let mut error = Vec::new();
     let mut pitch_matches = 0;
@@ -337,11 +337,11 @@ pub(crate) fn compare(job: &Value, sofa: &Value, legacy: &Value) -> Value {
         let delta = (ls - rs).abs().max((le - re).abs());
         error.push(delta);
         timing.push((1.0 - delta / one_beat.max(1e-6)).max(0.0));
-        let left_pitch = sofa_pitch
+        let left_pitch = forcealign_pitch
             .get(field_text(left, "token_id"))
             .copied()
             .unwrap_or_else(|| midi(left));
-        let right_pitch = legacy_pitch
+        let right_pitch = mms_pitch
             .get(field_text(right, "token_id"))
             .copied()
             .unwrap_or_else(|| midi(right));
@@ -369,10 +369,10 @@ pub(crate) fn compare(job: &Value, sofa: &Value, legacy: &Value) -> Value {
         })
         .unwrap_or_default();
     json!({
-        "status":"completed","sofa_available":true,"legacy_available":true,"compared_word_count":pairs.len(),
+        "status":"completed","forcealign_available":true,"mms_available":true,"compared_word_count":pairs.len(),
         "timing_agreement":round(timing,4),"pitch_agreement":round(pitch,4),"pitch_exact_fraction":round(pitch,4),
         "timing_mean_abs_error_ms":round(mean(&error)*1000.0,2),"one_chart_beat_ms":round(one_beat*1000.0,2),
-        "confidence":round(confidence,4),"preferred_mode":if confidence >= 0.5 {"sofa"} else {"legacy"},
+        "confidence":round(confidence,4),"preferred_mode":if confidence >= 0.5 {"forcealign"} else {"mms"},
         "updated_at":updated_at,
     })
 }
@@ -400,8 +400,17 @@ pub(crate) fn apply_canonical(
         true,
     )?;
     let canonical = as_variant(&result);
-    result["alignment_results"] = json!({"canonical":canonical,"sofa":canonical});
-    result["current_alignment_mode"] = json!("canonical");
+    let model_key = if field_text(run, "selected_strategy").starts_with("mms") {
+        "mms"
+    } else {
+        "forcealign"
+    };
+    result["alignment_results"] = if model_key == "mms" {
+        json!({"canonical":canonical,"mms":canonical})
+    } else {
+        json!({"canonical":canonical,"forcealign":canonical})
+    };
+    result["current_alignment_mode"] = json!(model_key);
     job["metadata"] = result["metadata"].clone();
     job["result"] = result;
     Ok(())
@@ -443,20 +452,29 @@ pub(crate) fn refresh(job: &mut Value) -> Result<bool, ApiError> {
     )?;
     let mode = field_text(previous, "current_alignment_mode");
     let variant = as_variant(&result);
-    result["alignment_results"] = json!({"canonical":variant,"sofa":variant});
-    result["current_alignment_mode"] = json!("canonical");
+    let model_key = if field_text(run, "selected_strategy").starts_with("mms") {
+        "mms"
+    } else {
+        "forcealign"
+    };
+    result["alignment_results"] = if model_key == "mms" {
+        json!({"canonical":variant,"mms":variant})
+    } else {
+        json!({"canonical":variant,"forcealign":variant})
+    };
+    result["current_alignment_mode"] = json!(model_key);
     let variants = &previous["alignment_results"];
     match mode {
-        "legacy" if !variants["sofa"].is_null() => {
-            result["alignment_results"]["legacy"] = variant.clone();
-            result["alignment_results"]["sofa"] = variants["sofa"].clone();
-            result["alignment_comparison"] = compare(job, &variants["sofa"], &variant);
-            result["current_alignment_mode"] = json!("legacy");
+        "mms" if !variants["forcealign"].is_null() => {
+            result["alignment_results"]["mms"] = variant.clone();
+            result["alignment_results"]["forcealign"] = variants["forcealign"].clone();
+            result["alignment_comparison"] = compare(job, &variants["forcealign"], &variant);
+            result["current_alignment_mode"] = json!("mms");
         }
-        "sofa" if !variants["legacy"].is_null() => {
-            result["alignment_results"]["legacy"] = variants["legacy"].clone();
-            result["alignment_comparison"] = compare(job, &variant, &variants["legacy"]);
-            result["current_alignment_mode"] = json!("sofa");
+        "forcealign" if !variants["mms"].is_null() => {
+            result["alignment_results"]["mms"] = variants["mms"].clone();
+            result["alignment_comparison"] = compare(job, &variant, &variants["mms"]);
+            result["current_alignment_mode"] = json!("forcealign");
         }
         _ => {}
     }

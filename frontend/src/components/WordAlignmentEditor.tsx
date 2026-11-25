@@ -37,7 +37,7 @@ const STATUS_CLASSES: Record<AlignmentStatus, string> = {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => window.setTimeout(resolve, ms))
-type AlignmentBackend = "sofa" | "legacy"
+type AlignmentBackend = "forcealign" | "mms"
 
 export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
   const jobId = () => props.jobId
@@ -72,7 +72,7 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
   const [busyToken, setBusyToken] = createSignal<string | null>(null)
   const [savingLyrics, setSavingLyrics] = createSignal(false)
   const [realigning, setRealigning] = createSignal(false)
-  const [alignmentBackend, setAlignmentBackend] = createSignal<AlignmentBackend>("sofa")
+  const [alignmentBackend, setAlignmentBackend] = createSignal<AlignmentBackend>("forcealign")
   const [error, setError] = createSignal<string | null>(null)
 
   const alignmentByToken = createMemo(() => new Map(alignments().map((alignment) => [alignment.token_id, alignment])))
@@ -88,8 +88,8 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
   createEffect(
     () => result().alignment_run?.selected_strategy,
     (strategy) => {
-      if (strategy?.startsWith("legacy")) setAlignmentBackend("legacy")
-      else if (strategy?.startsWith("sofa")) setAlignmentBackend("sofa")
+      if (strategy?.startsWith("mms")) setAlignmentBackend("mms")
+      else if (strategy?.startsWith("forcealign")) setAlignmentBackend("forcealign")
     },
   )
 
@@ -240,19 +240,23 @@ export const WordAlignmentEditor = (props: WordAlignmentEditorProps) => {
       </div>
 
       <div class="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-zinc-700/50 bg-zinc-950/50 p-3">
-        <label class="flex items-center gap-2 text-sm text-zinc-300">
-          <input
-            type="checkbox"
-            checked={alignmentBackend() === "legacy"}
-            onChange={(event) => setAlignmentBackend(event.target.checked ? "legacy" : "sofa")}
-            disabled={realigning()}
-            class="accent-violet-500"
-          />
-          <span>
-            Use legacy non-SOFA alignment
-            <span class="ml-1 text-zinc-500">(ASR/CTC fallback)</span>
-          </span>
-        </label>
+        <div class="space-y-2">
+          <p class="max-w-2xl text-xs text-zinc-400">
+            English starts with ForceAlign and runs MMS in the background. Polish uses MMS.
+          </p>
+          <label class="flex items-center gap-2 text-sm text-zinc-300">
+            <input
+              type="checkbox"
+              checked={alignmentBackend() === "mms"}
+              onChange={(event) => setAlignmentBackend(event.target.checked ? "mms" : "forcealign")}
+              disabled={realigning()}
+              class="accent-violet-500"
+            />
+            <span>
+              Use stock MMS_FA for this run
+            </span>
+          </label>
+        </div>
         <button
           type="button"
           onClick={realign}

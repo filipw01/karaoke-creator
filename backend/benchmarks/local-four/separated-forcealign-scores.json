@@ -1,0 +1,32 @@
+[
+  {
+    "song": "Warriors",
+    "model": "ForceAlign",
+    "reference_words": 185,
+    "timed_words": 185,
+    "coverage": 1.0,
+    "within_one_beat": 0.24324324324324326,
+    "start_mae_ms": 293.3311286251266,
+    "end_mae_ms": 286.41781703819237
+  },
+  {
+    "song": "A sky full of stars",
+    "model": "ForceAlign",
+    "reference_words": 156,
+    "timed_words": 156,
+    "coverage": 1.0,
+    "within_one_beat": 0.2692307692307692,
+    "start_mae_ms": 1618.3468057130774,
+    "end_mae_ms": 1599.8181707696792
+  },
+  {
+    "song": "I feel it coming",
+    "model": "ForceAlign",
+    "reference_words": 393,
+    "timed_words": 393,
+    "coverage": 1.0,
+    "within_one_beat": 0.24681933842239187,
+    "start_mae_ms": 595.2854611193861,
+    "end_mae_ms": 520.146426837226
+  }
+]

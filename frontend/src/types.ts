@@ -116,8 +116,8 @@ export interface AlignmentVariant {
 
 export interface AlignmentComparison {
   status: "idle" | "running" | "completed" | "failed" | "not_supported"
-  sofa_available?: boolean
-  legacy_available?: boolean
+  forcealign_available?: boolean
+  mms_available?: boolean
   compared_word_count?: number
   timing_agreement?: number
   pitch_agreement?: number

@@ -1,0 +1,42 @@
+[
+  {
+    "song": "Warriors",
+    "reference_word_count": 185,
+    "timed_word_count": 101,
+    "coverage": 0.5459459459459459,
+    "within_tolerance": 0.05405405405405406,
+    "start_mae_ms": 9946.5659,
+    "end_mae_ms": 10081.0948,
+    "primary_source": "vocal_stem"
+  },
+  {
+    "song": "A sky full of stars",
+    "reference_word_count": 156,
+    "timed_word_count": 53,
+    "coverage": 0.33974358974358976,
+    "within_tolerance": 0.0,
+    "start_mae_ms": 11432.566037735849,
+    "end_mae_ms": 11528.90566037736,
+    "primary_source": "vocal_stem"
+  },
+  {
+    "song": "I feel it coming",
+    "reference_word_count": 393,
+    "timed_word_count": 251,
+    "coverage": 0.638676844783715,
+    "within_tolerance": 0.027989821882951654,
+    "start_mae_ms": 29012.089359613725,
+    "end_mae_ms": 29096.94006973719,
+    "primary_source": "vocal_stem"
+  },
+  {
+    "song": "Dlugosc Dzwieku Samotnosci",
+    "reference_word_count": 200,
+    "timed_word_count": 192,
+    "coverage": 0.96,
+    "within_tolerance": 0.11,
+    "start_mae_ms": 890.3116911764715,
+    "end_mae_ms": 851.7553676470578,
+    "primary_source": "vocal_stem"
+  }
+]

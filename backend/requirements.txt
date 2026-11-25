@@ -1,6 +1,5 @@
 pydantic>=2.6.0
 demucs>=4.0.1
-faster-whisper>=1.0.0
 librosa>=0.10.1
 scipy>=1.10.0
 soundfile>=0.12.1
@@ -8,7 +7,6 @@ numpy>=1.26.0
 ffmpeg-python>=0.2.0
 g2p_en>=2.1.0
 pytest>=8.0.0
-whisperx>=3.8.1
 # Optional source of Basic Pitch weights. The Rust utility runs ONNX inference.
 # basic-pitch>=0.3.0
 # Optional GPU-only song-aware ASR/forced-alignment evidence:

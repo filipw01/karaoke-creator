@@ -225,7 +225,7 @@ async fn initial_alignment(
         let revision_id = selected(job).map_or_else(String::new, |revision| {
             field_text(revision, "id").to_owned()
         });
-        *run = register_run(job, &revision_id, "sofa")?;
+        *run = register_run(job, &revision_id, "forcealign")?;
         Ok(job.clone())
     })?;
     emit(jobs, id, &job);
@@ -276,7 +276,7 @@ async fn initial_alignment(
             revision
         };
         run["lyric_revision_id"] = revision["id"].clone();
-        let lane = engine::resolve_backend(field_text(&revision, "language"), "sofa");
+        let lane = engine::resolve_backend(field_text(&revision, "language"), "forcealign");
         run["selected_strategy"] = json!(engine::strategy(&lane));
         set_run(job, run);
         status(
@@ -287,7 +287,7 @@ async fn initial_alignment(
         Ok((job.clone(), revision))
     })?;
     emit(jobs, id, &job);
-    let lane = engine::resolve_backend(field_text(&revision, "language"), "sofa");
+    let lane = engine::resolve_backend(field_text(&revision, "language"), "forcealign");
     let aligned = engine::align(
         api,
         &job,
@@ -377,7 +377,7 @@ async fn finish_publication(
         status(job, "done", "Done! Your karaoke song is ready.");
         let result = &mut job["result"];
         let comparison = result["lyric_revision"]["language"] == "en"
-            && field_text(&result["alignment_run"], "selected_strategy").contains("sofa")
+            && field_text(&result["alignment_run"], "selected_strategy").contains("forcealign")
             && array_or_object_empty(&result["alignment_comparison"]);
         let revision = if comparison {
             result["alignment_comparison"] = comparing();
@@ -636,7 +636,7 @@ async fn confirm(
         Ok(Some(claim_realign(
             job,
             revision,
-            "sofa",
+            "forcealign",
             Vec::new(),
             false,
             "Re-aligning the selected lyric revision...",
@@ -666,13 +666,13 @@ async fn start_run(
         check_realign(job)?;
         let lane = body
             .get("alignment_backend")
-            .map_or(Some("sofa"), Value::as_str)
+            .map_or(Some("forcealign"), Value::as_str)
             .unwrap_or_default()
             .trim()
             .to_lowercase();
-        if !matches!(lane.as_str(), "sofa" | "legacy") {
+        if !matches!(lane.as_str(), "forcealign" | "mms") {
             return Err(ApiError::invalid(
-                "alignment_backend must be sofa or legacy",
+                "alignment_backend must be forcealign or mms",
             ));
         }
         let revision_id = body["lyric_revision_id"]
@@ -752,7 +752,7 @@ async fn regenerate(
         claim_realign(
             job,
             revision,
-            "sofa",
+            "forcealign",
             resets,
             body.get("normalize")
                 .and_then(Value::as_bool)
@@ -770,7 +770,7 @@ async fn regenerate(
 }
 
 fn comparing() -> Value {
-    json!({"status":"running","sofa_available":true,"legacy_available":false})
+    json!({"status":"running","forcealign_available":true,"mms_available":false})
 }
 
 fn schedule_comparison(api: Api, jobs: Arc<ManagedJobs>, id: String, revision: Value, base: Value) {
@@ -780,7 +780,7 @@ fn schedule_comparison(api: Api, jobs: Arc<ManagedJobs>, id: String, revision: V
                 if job["result"]["alignment_run"]["id"] != base {
                     return Err(conflict("Comparison was superseded"));
                 }
-                let run = register_run(job, field_text(&revision, "id"), "legacy")?;
+                let run = register_run(job, field_text(&revision, "id"), "mms")?;
                 Ok((job.clone(), run))
             })?;
             let aligned = async {
@@ -791,7 +791,7 @@ fn schedule_comparison(api: Api, jobs: Arc<ManagedJobs>, id: String, revision: V
                     &revision,
                     &run,
                     inputs,
-                    "legacy",
+                    "mms",
                     &[],
                     &[],
                     false,
@@ -807,7 +807,7 @@ fn schedule_comparison(api: Api, jobs: Arc<ManagedJobs>, id: String, revision: V
                         if job["result"]["alignment_run"]["id"] != base {
                             return Ok(job.clone());
                         }
-                        let legacy = projection::as_variant(&projection::build_variant(
+                        let mms = projection::as_variant(&projection::build_variant(
                             job,
                             &revision,
                             &run,
@@ -817,14 +817,16 @@ fn schedule_comparison(api: Api, jobs: Arc<ManagedJobs>, id: String, revision: V
                             &aligned.breaks,
                             true,
                         )?);
-                        let key = managed_editor::variant_key(&job["result"], "sofa");
-                        let sofa = job["result"]["alignment_results"][key].clone();
-                        if sofa.is_null() {
-                            return Err(conflict("SOFA result is unavailable for comparison"));
+                        let key = managed_editor::variant_key(&job["result"], "forcealign");
+                        let forcealign = job["result"]["alignment_results"][key].clone();
+                        if forcealign.is_null() {
+                            return Err(conflict(
+                                "ForceAlign result is unavailable for comparison",
+                            ));
                         }
-                        let comparison = projection::compare(job, &sofa, &legacy);
-                        job["result"]["alignment_results"]["sofa"] = sofa;
-                        job["result"]["alignment_results"]["legacy"] = legacy;
+                        let comparison = projection::compare(job, &forcealign, &mms);
+                        job["result"]["alignment_results"]["forcealign"] = forcealign;
+                        job["result"]["alignment_results"]["mms"] = mms;
                         job["result"]["alignment_comparison"] = comparison;
                         Ok(job.clone())
                     })?;
@@ -859,8 +861,8 @@ fn comparison_failure(
         if job["result"]["alignment_run"]["id"] == *base {
             let variants = &job["result"]["alignment_results"];
             job["result"]["alignment_comparison"] = json!({
-                "status":"failed","sofa_available":!variants["sofa"].is_null()||!variants["canonical"].is_null(),
-                "legacy_available":false,"error":error,
+                "status":"failed","forcealign_available":!variants["forcealign"].is_null()||!variants["canonical"].is_null(),
+                "mms_available":false,"error":error,
             });
         }
         Ok(job.clone())
@@ -893,7 +895,7 @@ async fn compare(
                 None,
             ));
         }
-        if !result["alignment_results"]["legacy"].is_null() {
+        if !result["alignment_results"]["mms"].is_null() {
             return Ok((
                 json!({"status":"completed","alignment_comparison":comparison}),
                 None,
@@ -901,25 +903,25 @@ async fn compare(
         }
         let run = &result["alignment_run"];
         let language = managed_ingest::language(field_text(&current, "language")).unwrap_or("en");
-        if language != "en" || !field_text(run, "selected_strategy").contains("sofa") {
-            let unsupported = json!({"status":"not_supported","sofa_available":false,"legacy_available":true,
-                "preferred_mode":"legacy","reason":"SOFA comparison is only enabled for English lyrics"});
+        if language != "en" || !field_text(run, "selected_strategy").contains("forcealign") {
+            let unsupported = json!({"status":"not_supported","forcealign_available":false,"mms_available":true,
+                "preferred_mode":"mms","reason":"MMS is the only configured model for non-English lyrics"});
             job["result"]["alignment_comparison"] = unsupported.clone();
             return Ok((
                 json!({"status":"not_supported","alignment_comparison":unsupported}),
                 None,
             ));
         }
-        let key = managed_editor::variant_key(result, "sofa");
-        let sofa = result["alignment_results"][key].clone();
-        if sofa.is_null() {
-            return Err(conflict("SOFA result is unavailable for comparison"));
+        let key = managed_editor::variant_key(result, "forcealign");
+        let forcealign = result["alignment_results"][key].clone();
+        if forcealign.is_null() {
+            return Err(conflict("ForceAlign result is unavailable for comparison"));
         }
         let base = run["id"].clone();
         let revision = revision(job, field_text(&body, "lyric_revision_id"))
             .cloned()
             .unwrap_or(current);
-        job["result"]["alignment_results"]["sofa"] = sofa;
+        job["result"]["alignment_results"]["forcealign"] = forcealign;
         let comparison = comparing();
         job["result"]["alignment_comparison"] = comparison.clone();
         Ok((

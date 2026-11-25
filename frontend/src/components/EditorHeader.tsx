@@ -10,7 +10,7 @@ interface EditorHeaderProps {
   onSave: () => void
   onExport: () => void
   onOpenLyricsAlignment: () => void
-  onModeChange: (mode: "sofa" | "legacy" | "canonical") => void
+  onModeChange: (mode: "forcealign" | "mms" | "canonical") => void
   switchingMode: string | null
   showLyricsAlignment?: boolean
   showExport?: boolean
@@ -19,10 +19,8 @@ interface EditorHeaderProps {
 export const EditorHeader = (props: EditorHeaderProps) => {
   const comparison = createMemo(() => props.result.alignment_comparison)
   const alignments = createMemo(() => props.result.alignment_results)
-  const modes = createMemo(() => (["sofa", "legacy"] as const).filter((mode) => alignments()?.[mode]))
-  const currentMode = createMemo(() => props.result.current_alignment_mode === "canonical" && props.result.alignment_results?.sofa
-    ? "sofa"
-    : props.result.current_alignment_mode ?? "canonical")
+  const modes = createMemo(() => (["forcealign", "mms"] as const).filter((mode) => alignments()?.[mode]))
+  const currentMode = createMemo(() => props.result.current_alignment_mode ?? "canonical")
   const confidence = createMemo(() => comparison()?.confidence)
   return (
     <div class="flex items-start justify-between gap-4">
@@ -49,15 +47,15 @@ export const EditorHeader = (props: EditorHeaderProps) => {
                       : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
                   } disabled:opacity-50`}
                 >
-                  {props.switchingMode === mode ? "Switching…" : mode.toUpperCase()}
+                  {props.switchingMode === mode ? "Switching…" : mode === "forcealign" ? "ForceAlign" : "MMS_FA"}
                 </button>
               )}
             </For>
             {comparison()?.status === "running" && (
-              <span class="text-xs text-amber-300">Legacy processing in background…</span>
+              <span class="text-xs text-amber-300">MMS_FA processing in background…</span>
             )}
             {comparison()?.status === "completed" && typeof confidence() === "number" && (
-              <span class="text-xs text-zinc-400" title="Agreement between SOFA and legacy timing/pitch results">
+              <span class="text-xs text-zinc-400" title="Agreement between ForceAlign and MMS_FA timing and pitch results">
                 Agreement {Math.round(confidence()! * 100)}%
                 {typeof comparison()!.timing_agreement === "number" && typeof comparison()!.pitch_agreement === "number"
                   ? ` · timing ${Math.round(comparison()!.timing_agreement! * 100)}% · pitch ${Math.round(comparison()!.pitch_agreement! * 100)}%`

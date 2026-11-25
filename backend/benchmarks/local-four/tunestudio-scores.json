@@ -1,0 +1,42 @@
+[
+  {
+    "song": "Warriors",
+    "model": "Tune Studio singing-tuned MMS CTC",
+    "reference_words": 185,
+    "timed_words": 185,
+    "coverage": 1.0,
+    "within_one_beat": 0.15135135135135136,
+    "start_mae_ms": 3008.8227736450667,
+    "end_mae_ms": 3071.4642994373744
+  },
+  {
+    "song": "A sky full of stars",
+    "model": "Tune Studio singing-tuned MMS CTC",
+    "reference_words": 156,
+    "timed_words": 147,
+    "coverage": 0.9423076923076923,
+    "within_one_beat": 0.1346153846153846,
+    "start_mae_ms": 12041.183465250011,
+    "end_mae_ms": 11475.785483019574
+  },
+  {
+    "song": "I feel it coming",
+    "model": "Tune Studio singing-tuned MMS CTC",
+    "reference_words": 393,
+    "timed_words": 331,
+    "coverage": 0.8422391857506362,
+    "within_one_beat": 0.08396946564885496,
+    "start_mae_ms": 5900.805314295598,
+    "end_mae_ms": 5980.821565562103
+  },
+  {
+    "song": "Dlugosc Dzwieku Samotnosci",
+    "model": "Tune Studio singing-tuned MMS CTC",
+    "reference_words": 200,
+    "timed_words": 191,
+    "coverage": 0.955,
+    "within_one_beat": 0.045,
+    "start_mae_ms": 4746.326283688653,
+    "end_mae_ms": 4624.246328389573
+  }
+]

@@ -31,7 +31,7 @@ source venv/bin/activate  # or venv\Scripts\activate on Windows
 pip install -r requirements.txt
 ```
 
-The local path uses WhisperX CTC forced alignment for canonical word timing and automatically selects CPU when no CUDA device is available. Faster-whisper remains a local anchor source, not a canonical timing source. Optional Qwen model backends are loaded only when enabled; they never send audio or lyrics to a third-party service.
+The desktop app runs stock torchaudio MMS_FA and ForceAlign Wav2Vec2 acoustic models through ONNX Runtime in Rust. English starts with ForceAlign and schedules MMS_FA as a background comparison; Polish uses MMS_FA. Python remains the canonical lyric reconciliation and pitch projection worker. Neither SOFA nor WhisperX is part of the active alignment path.
 
 Local API state is stored in `backend/outputs/jobs.json` and recovered after a
 restart. For a network deployment, set `KARAOKE_API_TOKEN` and the matching
@@ -84,9 +84,7 @@ the worker supplies canonical alignment evidence.
 
 Draft lyrics use whisper.cpp on the machine running the draft. Install `whisper-cli` and set
 `KARAOKE_WHISPER_CPP_MODEL` to a multilingual GGML Whisper checkpoint.
-Set `KARAOKE_WHISPER_CPP_PATH` if `whisper-cli` is outside PATH. When a
-remote alignment worker is configured, set these variables on that worker.
-Forced alignment and its ASR evidence still use the existing Python models. [whisper.cpp and model setup](https://github.com/ggml-org/whisper.cpp#quick-start)
+Set `KARAOKE_WHISPER_CPP_PATH` if `whisper-cli` is outside PATH. [whisper.cpp and model setup](https://github.com/ggml-org/whisper.cpp#quick-start)
 
 On first launch, choose a working directory for your song library. You can
 open, play, edit, and save existing UltraStar charts in the desktop app without
@@ -108,14 +106,25 @@ cd backend
 ./run.sh
 ```
 
-WhisperX CTC is enabled by default. Set the device explicitly only when needed:
+Alignment models are exported once as ONNX files and loaded by the Rust desktop app. From an environment with PyTorch and torchaudio installed:
 
 ```bash
-cd backend
-source venv/bin/activate
-export WHISPERX_DEVICE=auto                         # cuda when available, otherwise cpu
-./run.sh
+python backend/scripts/export_alignment_models.py --output-dir backend/models/alignment
 ```
+
+Set `ALIGNMENT_MODELS_DIR` to that directory when launching the app, or set
+`ALIGNMENT_MMS_ONNX_PATH`, `ALIGNMENT_FORCEALIGN_ONNX_PATH`, and
+`ALIGNMENT_VOCAB_PATH` individually. The exporter downloads stock torchaudio
+weights. These large ONNX files are local model assets and are not committed to
+the repository. Set `ORT_DYLIB_PATH` if ONNX Runtime's dynamic library is not
+discoverable on the system.
+
+English uses ForceAlign as the fast first pass and schedules stock MMS_FA in
+the background after the chart is published. The editor can also request MMS_FA
+for a new alignment run. Polish routes directly to MMS_FA because the
+ForceAlign acoustic model is English-only. Both models use the separated vocal
+stem. Python maps their spans to canonical lyric tokens and applies pitch,
+phrase, and manual-lock behavior.
 
 Pitch detection uses the separated vocal stem with Basic Pitch when its
 optional ONNX model/runtime is installed; minimal installations fall back to
@@ -171,53 +180,19 @@ For a deliberate high-quality, serial Demucs run, use `DEMUCS_MODEL=htdemucs_ft`
 with `DEMUCS_SHIFTS=1` and `DEMUCS_JOBS=0`; the default remains `htdemucs` to
 keep local RAM and processing time predictable.
 
-For a diagnostic run that intentionally disables CTC, set `ALIGNMENT_CTC_BACKEND=off`.
-If CTC cannot load and the English transcript is sparse, the worker automatically
-falls back to the installed ForceAlign backend so it does not fabricate a full
-song of timings from activity bleed. Disable that fallback on a RAM-constrained
-worker with `ALIGNMENT_AUTO_FORCEALIGN=0`.
-Qwen3-ASR remains an optional GPU evidence source:
-
-```bash
-export ALIGNMENT_ASR_BACKEND=qwen
-export QWEN_DEVICE=cuda:0
-```
-
-For an additional, English-only Wav2Vec2 timing source, install `forcealign`.
-It is CPU-heavy and runs one serialized model call at a time; use the explicit
-setting below to force it even when CTC is available:
-
-```bash
-pip install forcealign
-export ALIGNMENT_WAV2VEC_BACKEND=forcealign
-```
-
-When Basic Pitch is enabled, the worker also analyzes a temporary 60% mix /
-40% vocal blend and merges those note boundaries into the vocal evidence
-lane. Disable that supplemental pass, or tune its mix ratio, with:
-
-```bash
-export ALIGNMENT_MELODY_BACKEND=basic_pitch
-export ALIGNMENT_MELODY_BLEND_ENABLED=0
-export ALIGNMENT_MELODY_BLEND_MIX=0.6
-```
-
-### Frontend (port 5173)
-
-```bash
-cd frontend
-npm run dev
-```
-
-Open http://localhost:5173 in your browser.
+Use the **Lyrics & alignment** dialog to select MMS_FA for a re-alignment run.
+English defaults to ForceAlign, then evaluates MMS_FA in the background. Polish
+always routes to MMS_FA. Both models require the ONNX assets described above.
 
 ### Word alignment worker
 
 The application keeps canonical lyric revisions and word alignments separate
-from pitch/note data. By default it uses local WhisperX CTC forced alignment
-for canonical timing, with faster-whisper available as matching evidence. A
-GPU worker can enable the self-hosted Qwen3 adapter in its own environment
-with:
+from pitch/note data. Rust runs acoustic inference with stock MMS_FA or
+ForceAlign ONNX models on the separated vocal stem. Python maps the returned
+word spans onto saved lyric-token order, handles manual timing locks, and
+projects pitch and phrase data. The app does not use faster-whisper, WhisperX,
+or SOFA for alignment. Optional Qwen3 support remains a separate worker-side
+transcript anchor feature when explicitly enabled.
 
 ```bash
 pip install -U qwen-asr
@@ -225,22 +200,8 @@ export ALIGNMENT_ASR_BACKEND=qwen
 export QWEN_DEVICE=cuda:0
 ```
 
-Qwen model weights are loaded lazily by the worker. To
-dispatch model work to a separate GPU service, set the endpoint, shared token,
-and the two sides of the audio-volume mapping:
-
-```bash
-# API process
-export ALIGNMENT_WORKER_URL=http://gpu-worker:8001/v1/alignments
-export ALIGNMENT_WORKER_TOKEN=shared-secret
-export ALIGNMENT_API_AUDIO_ROOT=/srv/karaoke/backend
-export ALIGNMENT_WORKER_AUDIO_ROOT=/srv/karaoke-worker/audio
-
-# GPU worker process
-export ALIGNMENT_WORKER_TOKEN=shared-secret
-export ALIGNMENT_WORKER_AUDIO_ROOT=/srv/karaoke-worker/audio
-./run.sh --serve-alignment-worker 0.0.0.0:8001
-```
+Qwen model weights are loaded lazily by the optional worker-side transcript
+feature. Alignment model inference runs in the Rust app on the local machine.
 
 The configured worker URL must return a complete `AlignmentWorkerResponse`;
 the API validates its job, revision, run, token coverage, finite boundaries,
@@ -317,43 +278,12 @@ To measure the explicit-chart path against the same fixture, add
 and `--min-within-tolerance .9`. This is a reference-backed upper-bound
 measurement; omit `--timing-reference` for the honest model-only score.
 
-### SOFA comparison pipeline
+### Historical model benchmarks
 
-`benchmark_alternatives.py` compares the normal pipeline with the optional
-[SOFA-combined](https://huggingface.co/Silasimo/SOFA-combined) singing forced
-aligner (implementation: [qiuqiao/SOFA](https://github.com/qiuqiao/SOFA)). Run
-the two pipelines sequentially to keep RAM bounded:
-
-```bash
-cd backend
-NLTK_DATA=nltk_data ./venv/bin/python benchmark_alternatives.py \
-  --pipeline current --json-output benchmarks/private/current-suite-score.json
-NLTK_DATA=nltk_data TORCH_NUM_THREADS=1 ./venv/bin/python benchmark_alternatives.py \
-  --pipeline sofa --json-output benchmarks/private/sofa-suite-score.json
-```
-
-The cached six-song comparison is a proxy when the original private TXT/MP3
-pairs are unavailable. It uses the cached generated chart as the reference and
-scores word identity, timing within one UltraStar beat, pitch, and split-note
-accuracy. Restore the original pairs under `~/Downloads` and use
-`benchmark_suite.py` for ground-truth scores. A completed chart can be opened
-in the editor with `POST /api/benchmark/import`; the request accepts the chart,
-full mix, vocal stem, and optional instrumental-stem paths and returns a normal
-local `job_id`.
-
-Production alignment now uses SOFA first when the local checkpoint is present.
-The previous ASR/CTC selector remains available as a compatibility fallback:
-set `ALIGNMENT_PRIMARY_BACKEND=legacy` or `ALIGNMENT_SOFA_BACKEND=off`. SOFA
-supplies word boundaries; pitch is assigned afterward from the separated vocal
-contour, with a small boundary context fallback for detector frames that land
-just outside a phonetic word span. The SOFA checkpoint currently targets
-English, so Polish requests automatically resolve to the preserved ASR/CTC
-path. Set `SOFA_ALLOW_NON_ENGLISH=1` only when deliberately testing SOFA on a
-non-English job.
-
-The editor's **Use legacy non-SOFA alignment** toggle sends the same choice for
-an explicit re-alignment run, so the archived timing behavior can be compared
-without restarting the server.
+Files under `backend/benchmarks/local-four/` preserve earlier local model
+comparisons, including SOFA and WhisperX results. Those models are no longer
+used by the desktop app. Current production alignment uses Rust ONNX inference
+for ForceAlign and MMS_FA.
 
 ## Output format
 
@@ -367,5 +297,5 @@ Place the extracted folder into your UltraStar Deluxe songs directory.
 
 ## Tech stack
 
-- **Backend**: Rust and Axum for HTTP, jobs, media, pitch, and charts. Python workers for Demucs, forced alignment, and its transcription evidence.
+- **Backend**: Rust and Axum for HTTP, jobs, media, pitch, forced-alignment inference, and charts. Python workers for Demucs and canonical lyric reconciliation.
 - **Frontend**: SolidJS, TypeScript, Vite, Tailwind CSS

@@ -1,0 +1,42 @@
+[
+  {
+    "song": "Warriors",
+    "model": "WhisperX CTC",
+    "reference_words": 185,
+    "timed_words": 185,
+    "coverage": 1.0,
+    "within_one_beat": 0.1891891891891892,
+    "start_mae_ms": 191.61379800853427,
+    "end_mae_ms": 203.25689900426553
+  },
+  {
+    "song": "A sky full of stars",
+    "model": "WhisperX CTC",
+    "reference_words": 156,
+    "timed_words": 156,
+    "coverage": 1.0,
+    "within_one_beat": 0.17307692307692307,
+    "start_mae_ms": 3098.4358974358984,
+    "end_mae_ms": 3324.7884615384637
+  },
+  {
+    "song": "I feel it coming",
+    "model": "WhisperX CTC",
+    "reference_words": 393,
+    "timed_words": 391,
+    "coverage": 0.9949109414758269,
+    "within_one_beat": 0.11450381679389313,
+    "start_mae_ms": 5119.167301123037,
+    "end_mae_ms": 5138.861218458899
+  },
+  {
+    "song": "Dlugosc Dzwieku Samotnosci",
+    "model": "WhisperX CTC",
+    "reference_words": 200,
+    "timed_words": 200,
+    "coverage": 1.0,
+    "within_one_beat": 0.195,
+    "start_mae_ms": 468.32249411764866,
+    "end_mae_ms": 453.8501882352939
+  }
+]

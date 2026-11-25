@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use tokio::task::spawn_blocking;
 
 use crate::{
+    alignment_models,
     api::Api,
     managed_api::field_text,
     managed_editor::{array, projection},
@@ -127,32 +128,18 @@ fn activity(detection: &pitch_detection::Detection) -> (Vec<f64>, f64, Vec<(f64,
 }
 
 pub(super) fn resolve_backend(language: &str, requested: &str) -> String {
-    let primary = std::env::var("ALIGNMENT_PRIMARY_BACKEND").unwrap_or_default();
-    let non_english = std::env::var("SOFA_ALLOW_NON_ENGLISH")
-        .ok()
-        .is_some_and(|value| {
-            !matches!(
-                value.trim().to_lowercase().as_str(),
-                "0" | "false" | "off" | "no" | "disabled"
-            )
-        });
-    if requested == "sofa"
-        && (matches!(
-            primary.trim().to_lowercase().as_str(),
-            "legacy" | "current" | "asr" | "off"
-        ) || (language != "en" && !non_english))
-    {
-        "legacy".into()
+    if language.starts_with("en") && requested == "forcealign" {
+        "forcealign".into()
     } else {
-        requested.into()
+        "mms".into()
     }
 }
 
 pub(super) fn strategy(backend: &str) -> &'static str {
-    if backend == "legacy" {
-        "legacy-global-match-and-candidate-score"
+    if backend == "forcealign" {
+        "forcealign-fast-mms-background"
     } else {
-        "sofa-primary-global-match-and-candidate-score"
+        "mms-fa"
     }
 }
 
@@ -240,7 +227,15 @@ pub(super) async fn draft(
 ) -> Result<(String, Vec<Value>), String> {
     if let Some(url) = remote_url() {
         let revision = json!({"id":format!("{}:draft-request:{}",field_text(job,"id"),uuid::Uuid::new_v4()),"language":language});
-        let request = worker_request(job, &revision, run, inputs, &inputs.vocals, "sofa", &[]);
+        let request = worker_request(
+            job,
+            &revision,
+            run,
+            inputs,
+            &inputs.vocals,
+            "forcealign",
+            &[],
+        );
         let response = remote_dispatch(api, url, request).await?;
         let text = field_text(&response, "draft_text").trim();
         let matches = response["job_id"] == job["id"]
@@ -315,6 +310,25 @@ pub(super) async fn align(
         inputs.duration = duration;
     }
     let (activity, threshold, spans) = activity(&inputs.detection);
+    let lyric_words: Vec<String> = array(&revision["tokens"])
+        .iter()
+        .map(|token| field_text(token, "display_text").to_owned())
+        .collect();
+    let audio = inputs.transcription.clone();
+    let model_name = lane.to_owned();
+    let model_evidence = spawn_blocking(move || {
+        if model_name == "mms" {
+            alignment_models::align_mms(&audio, &lyric_words)
+        } else {
+            alignment_models::align_forcealign(&audio, &lyric_words)
+        }
+    })
+    .await
+    .map_err(|error| Failure::from(error.to_string()))?
+    .map_err(|error| Failure {
+        error,
+        diagnostics: json!({"model":lane,"stage":"rust_onnx_inference"}),
+    })?;
     let request = worker_request(
         job,
         revision,
@@ -324,18 +338,13 @@ pub(super) async fn align(
         lane,
         &spans,
     );
-    let remote = if let Some(url) = remote_url() {
-        Some(remote_dispatch(api, url, request.clone()).await?)
-    } else {
-        None
-    };
     let alignments = if use_locks {
         array(&job["result"]["word_alignments"])
     } else {
         &[]
     };
     let response = api.worker.run(&api.backend,"managed_alignment",json!({
-        "request":request,"remote_response":remote,"times":inputs.detection.times,"activity":activity,
+        "request":request,"rust_model_evidence":model_evidence,"model_backend":lane,"times":inputs.detection.times,"activity":activity,
         "activity_threshold":threshold,"audio_duration":inputs.duration,"fallback_words":fallback,
         "previous_tokens":array(&job["result"]["lyric_revision"]["tokens"]),
         "previous_alignments":alignments,"reset_token_ids":resets,

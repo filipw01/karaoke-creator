@@ -38,30 +38,11 @@ from processing.alignment import (
 )
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().casefold() not in {"0", "false", "off", "no", "disabled"}
+def resolve_alignment_backend(language: str | None, requested: str | None = "forcealign") -> str:
+    """Validate the selected model lane; Rust performs model inference."""
 
-
-def sofa_language_allowed(language: str | None) -> bool:
-    """Return whether SOFA is supported for the requested lyric language."""
-
-    normalized = normalize_language(language)
-    return normalized == "en" or _env_flag("SOFA_ALLOW_NON_ENGLISH", False)
-
-
-def resolve_alignment_backend(language: str | None, requested: str | None = "sofa") -> str:
-    """Resolve the backend while keeping SOFA English-only by default."""
-
-    backend = (requested or "sofa").strip().casefold()
-    configured_primary = os.environ.get("ALIGNMENT_PRIMARY_BACKEND", "").strip().casefold()
-    if backend == "sofa" and configured_primary in {"legacy", "current", "asr", "off"}:
-        backend = "legacy"
-    if backend == "sofa" and not sofa_language_allowed(language):
-        backend = "legacy"
-    return backend
+    backend = (requested or "forcealign").strip().casefold()
+    return backend if backend in {"forcealign", "mms"} else "forcealign"
 
 
 class WorkerToken(BaseModel):
@@ -99,7 +80,7 @@ class AlignmentWorkerRequest(BaseModel):
     language: StrictStr
     original_audio_ref: StrictStr
     vocal_stem_audio_ref: StrictStr
-    alignment_backend: StrictStr = "sofa"
+    alignment_backend: StrictStr = "forcealign"
     tokens: list[WorkerToken] = Field(default_factory=list)
     activity_spans: list[tuple[float, float]] = Field(default_factory=list)
     timing_grid_step: float | None = None
@@ -121,8 +102,8 @@ class AlignmentWorkerRequest(BaseModel):
     def validate_contract(self) -> "AlignmentWorkerRequest":
         self.language = normalize_language(self.language)
         self.alignment_backend = resolve_alignment_backend(self.language, self.alignment_backend)
-        if self.alignment_backend not in {"sofa", "legacy"}:
-            raise ValueError("alignment_backend must be sofa or legacy")
+        if self.alignment_backend not in {"forcealign", "mms"}:
+            raise ValueError("alignment_backend must be forcealign or mms")
         token_ids = [token.id for token in self.tokens]
         if len(token_ids) != len(set(token_ids)):
             raise ValueError("worker request contains duplicate token IDs")
@@ -219,7 +200,7 @@ def build_worker_request(
     vocal_stem_audio_ref: str,
     activity_spans: Sequence[tuple[float, float]] = (),
     timing_grid: tuple[float, float] | None = None,
-    alignment_backend: str = "sofa",
+    alignment_backend: str = "forcealign",
 ) -> AlignmentWorkerRequest:
     return AlignmentWorkerRequest(
         job_id=job_id,
@@ -566,19 +547,12 @@ def _candidate_sources(
             forced_clock_warps[sequence_index] = (start, end)
             previous_end = end
 
-    configured_primary = getattr(request, "alignment_backend", "") or os.environ.get(
-        "ALIGNMENT_PRIMARY_BACKEND", "sofa"
-    )
-    environment_primary = os.environ.get("ALIGNMENT_PRIMARY_BACKEND", "").strip().casefold()
-    if configured_primary == "sofa" and environment_primary in {"legacy", "current", "asr", "off"}:
-        configured_primary = environment_primary
-    configured_primary = configured_primary.strip().casefold()
+    configured_primary = (getattr(request, "alignment_backend", "") or "forcealign").strip().casefold()
     primary_source = (
         "ultrastar_chart"
         if "ultrastar_chart" in asr_outputs
-        else "sofa:vocal_stem"
-        if configured_primary not in {"legacy", "current", "asr", "off"}
-        and "sofa:vocal_stem" in asr_outputs
+        else f"{configured_primary}:vocal_stem"
+        if f"{configured_primary}:vocal_stem" in asr_outputs
         else "vocal_stem"
         if "vocal_stem" in asr_outputs
         else next(iter(asr_outputs), "")
@@ -586,7 +560,7 @@ def _candidate_sources(
     primary = list(asr_outputs.get(primary_source, ()))
     candidates: list[AlignmentCandidate] = []
 
-    ctc_source = "whisperx_ctc:vocal_stem"
+    ctc_source = "mms:vocal_stem"
 
     try:
         ctc_physical_clock_max_delta = float(
@@ -1415,7 +1389,7 @@ def _candidate_sources(
                 and physical in asr_outputs
             )
             ctc_self_anchor = (
-                source == "whisperx_ctc:vocal_stem"
+                source == ctc_source
                 and asr.evidence_type.casefold() == "ctc"
                 and ctc_clock_supported
             )
@@ -1777,9 +1751,9 @@ def run_local_alignment(
     diagnostics.update(
         {
             "strategy": (
-                "sofa-primary-global-match-and-candidate-score"
-                if diagnostics.get("primary_audio_source") == "sofa:vocal_stem"
-                else "legacy-global-match-and-candidate-score"
+                "mms-primary-global-match-and-candidate-score"
+                if diagnostics.get("primary_audio_source") == "mms:vocal_stem"
+                else "forcealign-primary-global-match-and-candidate-score"
             ),
             "global_score": global_result.score,
             "candidate_diagnostics": [
@@ -1815,43 +1789,21 @@ def collect_model_evidence(
     """Run configured model adapters for both physical audio sources."""
 
     from processing.model_adapters import (
-        align_with_forcealign,
         align_with_qwen_forced,
-        align_with_sofa,
-        align_with_whisperx,
         basic_pitch_enabled,
-        forcealign_enabled,
         detect_basic_pitch_boundaries,
         melody_blend_enabled,
         qwen_asr_enabled,
         run_serialized_model_call,
-        sofa_aligner_enabled,
         transcribe_with_qwen,
-        whisperx_enabled,
         write_melody_blend_audio,
     )
-
-    from processing.lyrics import LyricsParams, extract_lyrics
 
     def env_bool(name: str, default: bool) -> bool:
         value = os.environ.get(name)
         if value is None:
             return default
         return value.strip().casefold() not in {"0", "false", "off", "no", "disabled"}
-
-    def env_float(name: str, default: float) -> float:
-        try:
-            value = float(os.environ.get(name, str(default)))
-        except (TypeError, ValueError):
-            return default
-        return value if math.isfinite(value) else default
-
-    def env_int(name: str, default: int) -> int:
-        try:
-            value = int(os.environ.get(name, str(default)))
-        except (TypeError, ValueError):
-            return default
-        return value if value >= 0 else default
 
     evidence: dict[str, list[ASRToken]] = {}
     errors: dict[str, str] = {}
@@ -1862,51 +1814,16 @@ def collect_model_evidence(
         ("vocal_stem", request.vocal_stem_audio_ref),
         ("original_mix", request.original_audio_ref),
     )
-    ctc_failed = False
-    for source, path in source_paths:
-        if not path or not os.path.exists(path):
-            errors[source] = "audio reference is missing on the worker host"
-            continue
-        try:
-            if qwen_asr_enabled():
+    if qwen_asr_enabled():
+        for source, path in source_paths:
+            if not path or not os.path.exists(path):
+                errors[source] = "audio reference is missing on the worker host"
+                continue
+            try:
                 tokens = run_serialized_model_call(transcribe_with_qwen, path, request.language)
-            else:
-                params = LyricsParams(
-                    language=request.language,
-                    audio_source="vocals" if source == "vocal_stem" else "original",
-                    # Whisper's default no-VAD path is prone to inventing the
-                    # first lyric phrase over an instrumental intro.  Keep
-                    # this production-safe and configurable for environments
-                    # with an unusually noisy separator.
-                    vad_filter=env_bool("ALIGNMENT_ASR_VAD_ENABLED", True),
-                    vad_threshold=max(0.05, min(0.95, env_float("ALIGNMENT_ASR_VAD_THRESHOLD", 0.35))),
-                    vad_min_silence_ms=env_int("ALIGNMENT_ASR_VAD_MIN_SILENCE_MS", 250),
-                    speech_pad_ms=env_int("ALIGNMENT_ASR_SPEECH_PAD_MS", 180),
-                    no_speech_threshold=max(0.0, min(1.0, env_float("ALIGNMENT_ASR_NO_SPEECH_THRESHOLD", 0.5))),
-                    condition_on_previous_text=env_bool(
-                        "ALIGNMENT_ASR_CONDITION_ON_PREVIOUS_TEXT", False
-                    ),
-                    min_word_confidence=max(
-                        0.0,
-                        min(1.0, env_float("ALIGNMENT_ASR_MIN_WORD_CONFIDENCE", 0.15)),
-                    ),
-                )
-                words = run_serialized_model_call(extract_lyrics, path, request.language, params)
-                tokens = [
-                    ASRToken(
-                        text=word.text,
-                        start=float(word.start),
-                        end=float(word.end),
-                        confidence=float(word.confidence),
-                        model="faster-whisper-compat",
-                        audio_source=source,
-                        evidence_type="anchor",
-                    )
-                    for word in words
-                ]
-            evidence[source] = [replace(token, audio_source=source) for token in tokens]
-        except Exception as exc:
-            errors[source] = str(exc)
+                evidence[source] = [replace(token, audio_source=source) for token in tokens]
+            except Exception as exc:
+                errors[source] = str(exc)
 
     if basic_pitch_enabled():
         for source, path in source_paths:
@@ -1970,75 +1887,6 @@ def collect_model_evidence(
         default=("", [], 0),
     )
 
-    # SOFA is the production timing source.  It consumes the independent ASR
-    # clock only to choose bounded windows; every returned interval is still
-    # matched back to the canonical lyric sequence before entering the worker
-    # candidate lattice.  Invalid/empty test fixtures are skipped so the
-    # legacy fallback remains deterministic in lightweight environments.
-    sofa_path = request.vocal_stem_audio_ref
-    sofa_language_enabled = (
-        request.language.casefold().startswith("en")
-        or env_bool("SOFA_ALLOW_NON_ENGLISH", False)
-    )
-    environment_legacy = os.environ.get("ALIGNMENT_PRIMARY_BACKEND", "").strip().casefold() in {
-        "legacy", "current", "asr", "off"
-    }
-    if (
-        request.alignment_backend != "legacy"
-        and not environment_legacy
-        and sofa_aligner_enabled()
-        and sofa_language_enabled
-        and sofa_path
-        and os.path.exists(sofa_path)
-        and request.tokens
-    ):
-        try:
-            import soundfile as sf
-
-            valid_sofa_audio = float(sf.info(sofa_path).duration) > 0.1
-        except Exception:
-            valid_sofa_audio = False
-        if valid_sofa_audio:
-            try:
-                sofa_tokens = run_serialized_model_call(
-                    align_with_sofa,
-                    sofa_path,
-                    canonical_tokens,
-                    request.language,
-                    anchor_tokens=best_anchors,
-                )
-                if sofa_tokens:
-                    evidence["sofa:vocal_stem"] = [
-                        replace(
-                            token,
-                            audio_source="vocal_stem",
-                            evidence_type="forced",
-                            model="sofa-combined",
-                        )
-                        for token in sofa_tokens
-                    ]
-            except Exception as exc:
-                errors["sofa:vocal_stem"] = str(exc)
-
-    if forcealign_enabled() and request.language == "en":
-        path = request.vocal_stem_audio_ref
-        if path and os.path.exists(path) and request.tokens:
-            try:
-                forced = run_serialized_model_call(
-                    align_with_forcealign,
-                    path,
-                    " ".join(token.display_text for token in request.tokens),
-                    request.language,
-                    anchor_tokens=best_anchors,
-                    activity_spans=request.activity_spans,
-                )
-                evidence["forcealign:vocal_stem"] = [
-                    replace(token, audio_source="vocal_stem", evidence_type="forced")
-                    for token in forced
-                ]
-            except Exception as exc:
-                errors["forcealign:vocal_stem"] = str(exc)
-
     for source, path in source_paths:
         if not path or not os.path.exists(path):
             continue
@@ -2068,51 +1916,6 @@ def collect_model_evidence(
                 ]
             except Exception as exc:
                 errors[f"forced_alignment:{source}"] = str(exc)
-        if whisperx_enabled():
-            try:
-                ctc = run_serialized_model_call(
-                    align_with_whisperx,
-                    path,
-                    " ".join(token.display_text for token in request.tokens),
-                    request.language,
-                    anchor_tokens=anchors,
-                )
-                evidence[f"whisperx_ctc:{source}"] = [
-                    replace(token, audio_source=source, evidence_type="ctc") for token in ctc
-                ]
-            except Exception as exc:
-                errors[f"whisperx_ctc:{source}"] = str(exc)
-                ctc_failed = True
-    # WhisperX is an optional dependency and commonly fails to import on CPU
-    # installations with a mismatched torchvision build.  If it failed and
-    # the ASR transcript is sparse, use the installed English ForceAlign
-    # backend as a bounded fallback rather than fabricating every missing
-    # word from activity spans.  The opt-out keeps RAM-constrained workers in
-    # the previous lightweight mode.
-    if (
-        ctc_failed
-        and env_bool("ALIGNMENT_AUTO_FORCEALIGN", True)
-        and request.language == "en"
-        and best_anchor_count < max(4, int(len(request.tokens) * 0.75))
-        and not evidence.get("forcealign:vocal_stem")
-    ):
-        path = request.vocal_stem_audio_ref
-        if path and os.path.exists(path) and request.tokens:
-            try:
-                forced = run_serialized_model_call(
-                    align_with_forcealign,
-                    path,
-                    " ".join(token.display_text for token in request.tokens),
-                    request.language,
-                    anchor_tokens=best_anchors,
-                    activity_spans=request.activity_spans,
-                )
-                evidence["forcealign:vocal_stem"] = [
-                    replace(token, audio_source="vocal_stem", evidence_type="forced")
-                    for token in forced
-                ]
-            except Exception as exc:
-                errors["forcealign:vocal_stem"] = str(exc)
     return evidence, errors
 
 

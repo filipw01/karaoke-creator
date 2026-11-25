@@ -1,3 +1,4 @@
+mod alignment_models;
 mod api;
 mod basic_pitch;
 mod catalog;

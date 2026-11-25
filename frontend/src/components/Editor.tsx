@@ -1233,7 +1233,7 @@ export const Editor = (props: EditorProps) => {
     }
   })
 
-  const handleModeChange = async (mode: "sofa" | "legacy" | "canonical") => {
+  const handleModeChange = async (mode: "forcealign" | "mms" | "canonical") => {
     if (switchingMode() || mode === (result().current_alignment_mode ?? "canonical")) return
     if (isDirty() || saving()) {
       setBlockedAction("mode")

@@ -1,0 +1,42 @@
+[
+  {
+    "song": "A sky full of stars",
+    "model": "stock MMS_FA",
+    "reference_words": 156,
+    "timed_words": 156,
+    "coverage": 1.0,
+    "within_one_beat": 0.36538461538461536,
+    "start_mae_ms": 869.2552823459378,
+    "end_mae_ms": 907.7391656659349
+  },
+  {
+    "song": "I feel it coming",
+    "model": "stock MMS_FA",
+    "reference_words": 393,
+    "timed_words": 393,
+    "coverage": 1.0,
+    "within_one_beat": 0.2595419847328244,
+    "start_mae_ms": 3954.3853086911063,
+    "end_mae_ms": 3956.9014677527507
+  },
+  {
+    "song": "Dlugosc Dzwieku Samotnosci",
+    "model": "stock MMS_FA",
+    "reference_words": 200,
+    "timed_words": 200,
+    "coverage": 1.0,
+    "within_one_beat": 0.51,
+    "start_mae_ms": 56.72143461785147,
+    "end_mae_ms": 183.39751875473794
+  },
+  {
+    "song": "Warriors",
+    "model": "stock MMS_FA",
+    "reference_words": 185,
+    "timed_words": 185,
+    "coverage": 1.0,
+    "within_one_beat": 0.5459459459459459,
+    "start_mae_ms": 124.38717949575646,
+    "end_mae_ms": 360.6836173879771
+  }
+]

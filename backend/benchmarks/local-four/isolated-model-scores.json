@@ -1,0 +1,82 @@
+[
+  {
+    "song": "Warriors",
+    "model": "faster-whisper anchors",
+    "reference_words": 185,
+    "timed_words": 51,
+    "coverage": 0.2756756756756757,
+    "within_one_beat": 0.0,
+    "start_mae_ms": 1258.658926728588,
+    "end_mae_ms": 1105.5939112487117
+  },
+  {
+    "song": "Warriors",
+    "model": "WhisperX CTC",
+    "reference_words": 185,
+    "timed_words": 89,
+    "coverage": 0.4810810810810811,
+    "within_one_beat": 0.05405405405405406,
+    "start_mae_ms": 4425.183027794206,
+    "end_mae_ms": 4504.709047900652
+  },
+  {
+    "song": "A sky full of stars",
+    "model": "faster-whisper anchors",
+    "reference_words": 156,
+    "timed_words": 7,
+    "coverage": 0.04487179487179487,
+    "within_one_beat": 0.0,
+    "start_mae_ms": 20254.285714285714,
+    "end_mae_ms": 19937.142857142855
+  },
+  {
+    "song": "A sky full of stars",
+    "model": "WhisperX CTC",
+    "reference_words": 156,
+    "timed_words": 80,
+    "coverage": 0.5128205128205128,
+    "within_one_beat": 0.0,
+    "start_mae_ms": 12071.3875,
+    "end_mae_ms": 12075.95
+  },
+  {
+    "song": "I feel it coming",
+    "model": "faster-whisper anchors",
+    "reference_words": 393,
+    "timed_words": 124,
+    "coverage": 0.3155216284987277,
+    "within_one_beat": 0.0,
+    "start_mae_ms": 787.3950094570425,
+    "end_mae_ms": 750.5808273612226
+  },
+  {
+    "song": "I feel it coming",
+    "model": "WhisperX CTC",
+    "reference_words": 393,
+    "timed_words": 319,
+    "coverage": 0.811704834605598,
+    "within_one_beat": 0.027989821882951654,
+    "start_mae_ms": 30457.303717743554,
+    "end_mae_ms": 30595.424801145327
+  },
+  {
+    "song": "Dlugosc Dzwieku Samotnosci",
+    "model": "faster-whisper anchors",
+    "reference_words": 200,
+    "timed_words": 0,
+    "coverage": 0.0,
+    "within_one_beat": 0.0,
+    "start_mae_ms": null,
+    "end_mae_ms": null
+  },
+  {
+    "song": "Dlugosc Dzwieku Samotnosci",
+    "model": "WhisperX CTC",
+    "reference_words": 200,
+    "timed_words": 200,
+    "coverage": 1.0,
+    "within_one_beat": 0.11,
+    "start_mae_ms": 1075.1872705882363,
+    "end_mae_ms": 1000.8927529411753
+  }
+]

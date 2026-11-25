@@ -188,7 +188,7 @@ export const startAlignmentRun = async (
   jobId: string,
   lyricRevisionId: string,
   resetTokenIds: Array<string> = [],
-  alignmentBackend: "sofa" | "legacy" = "sofa",
+  alignmentBackend: "forcealign" | "mms" = "forcealign",
 ): Promise<{ alignment_run_id: string; lyric_revision_id: string; status: string }> => {
   const res = await fetch(`${BASE}/jobs/${jobId}/alignment-runs`, {
     method: "POST",
@@ -218,7 +218,7 @@ export const startAlignmentComparison = async (
 
 export const switchAlignmentMode = async (
   jobId: string,
-  mode: "sofa" | "legacy" | "canonical",
+  mode: "forcealign" | "mms" | "canonical",
 ): Promise<JobResult> => {
   const res = await fetch(`${BASE}/jobs/${jobId}/alignment-mode`, {
     method: "PATCH",

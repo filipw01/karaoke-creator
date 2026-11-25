@@ -1,0 +1,22 @@
+{
+  "audio_preparation": "Demucs htdemucs --two-stems=vocals, CPU; all aligners below received separated vocals. Original mix was retained only as the request original-audio reference for app scoring.",
+  "anchor_policy": "No faster-whisper. Qwen ASR disabled. SOFA and Tune Studio had no ASR timing anchors and used lyric-order interpolation for bounded windows. WhisperX CTC aligned supplied chart lyrics directly.",
+  "scored_models": [
+    "WhisperX CTC",
+    "stock MMS_FA",
+    "SOFA-combined",
+    "Tune Studio singing-tuned MMS CTC",
+    "ForceAlign"
+  ],
+  "not_scored": {
+    "SOFA-combined": "English-only in this setup; Polish unsupported.",
+    "ForceAlign": "English-only in this adapter; Polish unsupported.",
+    "Qwen3-ASR / Qwen3-ForcedAligner": "Not rerun; this machine has no CUDA or MPS accelerator and CPU model inference was not attempted.",
+    "IPA-native singing aligner": "No usable local checkpoint/inference adapter in the project."
+  },
+  "caveats": [
+    "Tune Studio Polish output uses Uroman transliteration into an English/German model vocabulary; treat it as exploratory.",
+    "SOFA and Tune Studio results here are from a no-ASR-anchor configuration, not the earlier faster-whisper-anchored runs.",
+    "Scores compare the supplied audio versions with the supplied UltraStar charts; audio/chart version mismatch may contribute to timing error."
+  ]
+}

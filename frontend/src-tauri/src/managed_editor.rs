@@ -191,8 +191,8 @@ async fn save_revision(
 pub(crate) fn variant_key(result: &Value, mode: &str) -> String {
     let variants = &result["alignment_results"];
     match mode {
-        "canonical" if variants.get("canonical").is_none() => "sofa",
-        "sofa" if variants.get("sofa").is_none() => "canonical",
+        "canonical" if variants.get("canonical").is_none() => "forcealign",
+        "forcealign" if variants.get("forcealign").is_none() => "canonical",
         _ => mode,
     }
     .into()
@@ -212,7 +212,7 @@ pub(crate) fn apply_variant(job: &mut Value, mode: &str) -> Result<String, ApiEr
     }
     let resolved = if mode == "canonical" && result["alignment_results"].get("canonical").is_none()
     {
-        "sofa"
+        "forcealign"
     } else {
         mode
     };
@@ -247,8 +247,8 @@ async fn switch_mode(
         if job["result"].is_null() {
             return Err(bad_request("No alignment result"));
         }
-        if !matches!(mode.as_str(), "sofa" | "legacy" | "canonical") {
-            return Err(invalid("mode must be sofa, legacy, or canonical"));
+        if !matches!(mode.as_str(), "forcealign" | "mms" | "canonical") {
+            return Err(invalid("mode must be forcealign, mms, or canonical"));
         }
         let resolved_mode = apply_variant(job, &mode)?;
         let mut result =
@@ -367,8 +367,8 @@ async fn save_notes(
         let before = variants[&key].clone();
         if !before.is_null() {
             let alias = match key.as_str() {
-                "canonical" => Some("sofa"),
-                "sofa" => Some("canonical"),
+                "canonical" => Some("forcealign"),
+                "forcealign" => Some("canonical"),
                 _ => None,
             };
             let mut updated = before.clone();
